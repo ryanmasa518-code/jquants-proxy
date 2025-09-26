@@ -295,6 +295,292 @@ async function handleScreenLiquidity(req, res) {
   }
 }
 
+// ===== A) /api/fins/statements =====
+// 目的: 直近の財務データから TTM EPS / ROE / ROA / DPS / 配当利回り を算出して返す
+// 使うAPI: GET /v1/fins/statements?code=XXXX
+// 注意: J-Quantsのキー名は時期により揺れがあるため、緩めにパース
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function pick(obj, keys) {
+  for (const k of keys) if (obj && obj[k] != null) return obj[k];
+  return undefined;
+}
+// 直近(四半期/通期)の配列を新しい順に並べ替える補助（可能なら 'DisclosedDate' や 'FiscalYear'+'FiscalQuarter' を使う）
+function sortRecent(a, b) {
+  const da = pick(a, ["DisclosedDate", "disclosedDate", "date"]) || `${pick(a,["FiscalYear","fiscalYear","fy"]) || ""}${pick(a,["FiscalQuarter","fiscalQuarter","fq"]) || ""}`;
+  const db = pick(b, ["DisclosedDate", "disclosedDate", "date"]) || `${pick(b,["FiscalYear","fiscalYear","fy"]) || ""}${pick(b,["FiscalQuarter","fiscalQuarter","fq"]) || ""}`;
+  return String(db).localeCompare(String(da));
+}
+
+// 4本で簡易TTM（直近4四半期合計）を作る
+function ttmFromQuarterly(rows, fields) {
+  const q = rows.filter(r => (pick(r, ["Type","type"]) || "").toString().toLowerCase().includes("q")); // 四半期だけに絞る(なければ後で通期fallback)
+  const recent4 = (q.length ? q : rows).slice(0, 4);
+  const out = {};
+  for (const [label, candidates] of Object.entries(fields)) {
+    out[label] = recent4.reduce((acc, r) => acc + num(pick(r, candidates)), 0);
+  }
+  return out;
+}
+
+// BPS(EQUITY/SHARE)やDPS(dividend per share)の抽出（キー揺れ対応）
+function extractPerShareLatest(rows) {
+  // 新しい順に見て、単位がそれっぽいものを拾う
+  for (const r of rows) {
+    const eps = pick(r, ["EPS","EarningsPerShare","BasicEPS","basicEps","eps"]);
+    const bps = pick(r, ["BPS","BookValuePerShare","bps"]);
+    const dps = pick(r, ["DPS","DividendPerShare","dividend","dividendPerShare","dividendsPerShare"]);
+    if (eps != null || bps != null || dps != null) {
+      return { eps: num(eps), bps: num(bps), dps: num(dps) };
+    }
+  }
+  return { eps: 0, bps: 0, dps: 0 };
+}
+
+async function fetchLatestClose(idToken, code) {
+  // 直近60日から最後の終値を拾う
+  const to = new Date();
+  const from = new Date(to.getTime() - 90 * 24 * 60 * 60_000);
+  const fmt = (d) => d.toISOString().slice(0,10).replace(/\D/g, "");
+  const data = await jqFetch("/prices/daily_quotes", { code, from: fmt(from), to: fmt(to) }, idToken);
+  const rows = Array.isArray(data) ? data : (data.daily_quotes || data.data || []);
+  const last = rows[rows.length - 1] || {};
+  const close = num(pick(last, ["Close","close","endPrice","AdjustedClose","adjusted_close"]));
+  return close;
+}
+
+async function handleFinsStatements(req, res) {
+  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
+  try {
+    const url = safeParseURL(req);
+    const code = (url.searchParams.get("code") || "").trim();
+    if (!code) return safeJson(res, 400, { error: "Missing code" });
+
+    const idToken = await ensureIdToken();
+    const resp = await jqFetch("/fins/statements", { code }, idToken);
+    const rows0 = Array.isArray(resp) ? resp : (resp.statements || resp.data || []);
+    if (!rows0.length) return safeJson(res, 404, { error: "No statements" });
+
+    const rows = [...rows0].sort(sortRecent); // 新しい順
+
+    // 直近の総資産、自己資本、当期純利益のTTM（四半期4本合計）
+    const ttm = ttmFromQuarterly(rows, {
+      revenue: ["NetSales","netSales","Revenue","revenue"],
+      op:      ["OperatingIncome","operatingIncome"],
+      ni:      ["NetIncome","netIncome","Profit","profit","ProfitAttributableToOwnersOfParent","netIncomeAttributableToOwnersOfParent"],
+    });
+
+    // 発行株式数（可能なら抽出）。見つからなければ EPS から逆算はしない（安全側）
+    const sh = pick(rows[0], ["SharesOutstanding","sharesOutstanding","NumberOfIssuedAndOutstandingShares","issuedShares"]) || 0;
+    const shares = num(sh);
+
+    const perShare = extractPerShareLatest(rows); // EPS/BPS/DPS（最新の数値）
+    // EPSをTTMで上書き（直近EPSが無い/古い場合に備え）
+    const epsTTM = (shares > 0 && ttm.ni) ? (ttm.ni / shares) : perShare.eps;
+
+    // 直近終値を取得
+    const close = await fetchLatestClose(idToken, code);
+    const mc = shares > 0 ? shares * close : 0;
+
+    // PER/PBR/配当利回り
+    const per = epsTTM > 0 ? (close / epsTTM) : null;
+    const pbr = perShare.bps > 0 ? (close / perShare.bps) : null;
+    const divYield = (perShare.dps > 0 && close > 0) ? (perShare.dps / close) : 0;
+
+    // ROE/ROA（TTM純利益 / 期末自己資本/総資産 の近似）
+    const equity = num(pick(rows[0], ["Equity","equity","TotalEquity","totalEquity","NetAssets","netAssets"]));
+    const assets = num(pick(rows[0], ["TotalAssets","totalAssets","Assets","assets"]));
+    const roe = (equity > 0 && ttm.ni) ? (ttm.ni / equity) : null;
+    const roa = (assets > 0 && ttm.ni) ? (ttm.ni / assets) : null;
+
+    // 要約
+    const summary = {
+      code,
+      close,
+      marketCap: mc,
+      eps_ttm: epsTTM,
+      bps: perShare.bps,
+      dps: perShare.dps,
+      per,
+      pbr,
+      dividend_yield: divYield, // 小数（0.03=3%）
+      roe,
+      roa,
+    };
+
+    safeJson(res, 200, { summary, raw_count: rows.length });
+  } catch (e) {
+    safeJson(res, 500, { error: String(e.message || e) });
+  }
+}
+
+// ===== B) /api/screen/basic =====
+// 入力例: ?market=Prime&limit=30&liquidity_min=100000000&per_lt=15&pbr_lt=1.2&div_yield_gt=0.03&mom3m_gt=0.05
+// 出力: スコア降順で {code,name,per,pbr,div_yield,mom_3m,avg_trading_value,score}
+
+async function calcAvgTradingValue(idToken, code, lookbackDays = 20) {
+  const to = new Date();
+  const from = new Date(to.getTime() - 90 * 24 * 60 * 60_000);
+  const fmt = (d) => d.toISOString().slice(0,10).replace(/\D/g, "");
+  const data = await jqFetch("/prices/daily_quotes", { code, from: fmt(from), to: fmt(to) }, idToken);
+  const rows = Array.isArray(data) ? data : (data.daily_quotes || data.data || []);
+  const recent = rows.slice(-lookbackDays);
+  if (!recent.length) return 0;
+  const avg = recent.reduce((a, r) => {
+    const c = num(pick(r, ["Close","close","endPrice","AdjustedClose","adjusted_close"]));
+    const v = num(pick(r, ["Volume","volume","turnoverVolume"]));
+    return a + c * v;
+  }, 0) / recent.length;
+  return Math.round(avg);
+}
+
+function nthFromEnd(arr, n) {
+  return arr[arr.length - 1 - n];
+}
+async function calcMomentum(idToken, code) {
+  // 1/3/6/12ヶ月リターン（営業日≒暦で近似）
+  const to = new Date();
+  const from = new Date(to.getTime() - 400 * 24 * 60 * 60_000);
+  const fmt = (d) => d.toISOString().slice(0,10).replace(/\D/g, "");
+  const data = await jqFetch("/prices/daily_quotes", { code, from: fmt(from), to: fmt(to) }, idToken);
+  const rows = Array.isArray(data) ? data : (data.daily_quotes || data.data || []);
+  if (rows.length < 40) return { r1m: 0, r3m: 0, r6m: 0, r12m: 0 };
+
+  const close = (r) => num(pick(r, ["Close","close","endPrice","AdjustedClose","adjusted_close"]));
+  const last = close(rows[rows.length - 1]);
+
+  const findAgo = (days) => {
+    const idx = Math.max(rows.length - 1 - Math.round(days), 0);
+    return close(rows[idx]);
+  };
+  const oneM = findAgo(21);
+  const threeM = findAgo(63);
+  const sixM = findAgo(126);
+  const twelveM = findAgo(252);
+
+  const ret = (cur, prev) => (prev > 0 ? (cur / prev - 1) : 0);
+  return {
+    r1m:  ret(last, oneM),
+    r3m:  ret(last, threeM),
+    r6m:  ret(last, sixM),
+    r12m: ret(last, twelveM),
+  };
+}
+
+function scoreRow(x) {
+  // シンプル合成：流動性(20) + バリュー(30) + モメンタム(30) + 配当(20) = 100
+  let s = 0;
+
+  // 流動性：1億で10点、5億で満点（線形クリップ）
+  const lv = Math.min(1, Math.max(0, (x.avg_trading_value - 1e8) / (5e8 - 1e8)));
+  s += lv * 20;
+
+  // バリュー：PER(15) + PBR(15) … 低いほど加点（PER 6〜15, PBR 0.6〜1.2で線形）
+  if (x.per) {
+    const perScore = Math.min(1, Math.max(0, (15 - x.per) / (15 - 6)));
+    s += perScore * 15;
+  }
+  if (x.pbr) {
+    const pbrScore = Math.min(1, Math.max(0, (1.2 - x.pbr) / (1.2 - 0.6)));
+    s += pbrScore * 15;
+  }
+
+  // モメンタム：3M(15) + 6M(15) … -10%〜+20% でスケーリング
+  const clip = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const scale = (v, lo, hi) => (clip(v, lo, hi) - lo) / (hi - lo);
+  s += scale(x.mom_3m || 0, -0.10, 0.20) * 15;
+  s += scale(x.mom_6m || 0, -0.10, 0.20) * 15;
+
+  // 配当：0〜4%で0→満点（超過はクリップ）
+  s += Math.min(1, (x.dividend_yield || 0) / 0.04) * 20;
+
+  return Math.round(s);
+}
+
+async function handleScreenBasic(req, res) {
+  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
+  try {
+    const url = safeParseURL(req);
+    const market = (url.searchParams.get("market") || "All").trim();
+    const limit  = Number(url.searchParams.get("limit") || "30");
+    const liqMin = Number(url.searchParams.get("liquidity_min") || "100000000"); // 1億
+    const perLt  = url.searchParams.get("per_lt");
+    const pbrLt  = url.searchParams.get("pbr_lt");
+    const divGt  = url.searchParams.get("div_yield_gt");
+    const mom3Gt = url.searchParams.get("mom3m_gt");
+
+    const idToken = await ensureIdToken();
+
+    // universe取得
+    const uni = await jqFetch("/listed/info", {}, idToken);
+    let list = Array.isArray(uni) ? uni : (uni.info || uni.data || []);
+    if (market && market !== "All") {
+      const mkey = market.toLowerCase();
+      list = list.filter(x => (x.market || x.market_code || "").toString().toLowerCase().includes(mkey));
+    }
+
+    // API負荷対策：まずは先頭から最大300でサンプリング（必要ならクエリで sample=N を追加）
+    const sample = list.slice(0, Math.min(300, list.length));
+    const out = [];
+
+    for (const it of sample) {
+      const code = it.code || it.Symbol || it.symbol || it.Code;
+      const name = it.company_name || it.Name || it.companyName || "";
+      if (!code) continue;
+
+      try {
+        // 流動性（平均売買代金）
+        const avgVal = await calcAvgTradingValue(idToken, code, 20);
+        if (avgVal < liqMin) continue;
+
+        // 財務（EPS/BPS/DPS/利回り等）
+        const fs = await jqFetch("/fins/statements", { code }, idToken);
+        const rows0 = Array.isArray(fs) ? fs : (fs.statements || fs.data || []);
+        if (!rows0.length) continue;
+        const rows = [...rows0].sort(sortRecent);
+        const perShare = extractPerShareLatest(rows);
+
+        // 価格・モメンタム
+        const lastClose = await fetchLatestClose(idToken, code);
+        const mom = await calcMomentum(idToken, code);
+
+        // PER/PBR/配当利回り
+        const per = (perShare.eps > 0) ? (lastClose / perShare.eps) : null;
+        const pbr = (perShare.bps > 0) ? (lastClose / perShare.bps) : null;
+        const divYield = (perShare.dps > 0 && lastClose > 0) ? (perShare.dps / lastClose) : 0;
+
+        // 事前フィルタ
+        if (perLt && per != null && !(per < Number(perLt))) continue;
+        if (pbrLt && pbr != null && !(pbr < Number(pbrLt))) continue;
+        if (divGt && !(divYield >= Number(divGt))) continue;
+        if (mom3Gt && !((mom.r3m || 0) >= Number(mom3Gt))) continue;
+
+        const row = {
+          code, name,
+          per, pbr,
+          dividend_yield: divYield,
+          mom_3m: mom.r3m, mom_6m: mom.r6m, mom_12m: mom.r12m,
+          avg_trading_value: avgVal,
+        };
+        row.score = scoreRow(row);
+        out.push(row);
+      } catch {
+        continue; // 個別失敗はスキップ
+      }
+    }
+
+    // スコア降順 → 上位limit件
+    out.sort((a, b) => (b.score - a.score));
+    safeJson(res, 200, { count: out.length, items: out.slice(0, limit) });
+  } catch (e) {
+    safeJson(res, 500, { error: String(e.message || e) });
+  }
+}
+
+
 // ---- Main handler (trailing slash吸収, GET/POST両対応) ----
 export default async function handler(req, res) {
   try {
