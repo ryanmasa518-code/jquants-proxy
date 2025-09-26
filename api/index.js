@@ -1,6 +1,6 @@
-// api/index.js — J-Quants proxy (PROD-hardened + credit endpoints)
+// api/index.js — J-Quants proxy (PROD-hardened + credit + portfolio)
 // 認証: Authorization: Bearer のみ（?key / X-Proxy-Key は無効）
-// TTL: /listed=24h, /prices=10m, /fins=3d, /credit/weekly=24h, /credit/daily_public=6h
+// TTL: /listed=24h, /prices=10m, /fins=3d, /credit/weekly=24h, /credit/daily_public=6h, /portfolio/summary=3h
 // 率制御: withLimit(MAX_CONCURRENCY=5) + リトライ(MAX_RETRIES=3, 基本待ち=400ms, 2倍指数)
 // キー管理: auth_refresh失敗時は JQ_EMAIL/PASSWORD でrefreshToken再取得（ENV設定前提）
 
@@ -505,6 +505,78 @@ async function handleScreenBasic(req,res){
   }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
 }
 
+// ===== portfolio: summary (multi-codes) =====
+async function handlePortfolioSummary(req, res) {
+  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
+  try {
+    const url = safeParseURL(req);
+    const codesParam = (url.searchParams.get("codes") || "").trim();
+    if (!codesParam) return safeJson(res, 400, { error: "Missing codes (comma-separated)" });
+    const withCredit = (url.searchParams.get("with_credit") || "0") === "1";
+
+    const codes = codesParam.split(",").map(s => s.trim()).filter(Boolean);
+    if (!codes.length) return safeJson(res, 400, { error: "No valid codes" });
+
+    const cacheKey = `portfolio:summary:${codes.slice().sort().join(",")}:${withCredit?"1":"0"}`;
+    const hit = getCached(cacheKey);
+    if (hit) return safeJson(res, 200, hit);
+
+    const idToken = await ensureIdToken();
+
+    const items = [];
+    for (const code of codes) {
+      try {
+        const [fs, lastClose] = await Promise.all([
+          jqFetch("/fins/statements", { code }, idToken),
+          fetchLatestClose(idToken, code),
+        ]);
+        const rows0 = Array.isArray(fs) ? fs : (fs.statements || fs.data || []);
+        if (!rows0.length) { items.push({ code, error: "No statements" }); continue; }
+        const rows = [...rows0].sort(sortRecent);
+
+        const ttm = ttmFromQuarterly(rows, {
+          ni: ["NetIncome","netIncome","Profit","profit","ProfitAttributableToOwnersOfParent","netIncomeAttributableToOwnersOfParent"],
+        });
+        const shares = num(pick(rows[0], ["SharesOutstanding","sharesOutstanding","NumberOfIssuedAndOutstandingShares","issuedShares"]));
+        const perShare = extractPerShareLatest(rows);
+        const epsTTM = (shares > 0 && ttm.ni) ? (ttm.ni / shares) : perShare.eps;
+
+        const per  = epsTTM > 0 ? (lastClose / epsTTM) : null;
+        const pbr  = perShare.bps > 0 ? (lastClose / perShare.bps) : null;
+        const yld  = (perShare.dps > 0 && lastClose > 0) ? (perShare.dps / lastClose) : 0;
+
+        const base = { code, close: lastClose, per, pbr, dividend_yield: yld, eps_ttm: epsTTM, bps: perShare.bps, dps: perShare.dps };
+
+        if (!withCredit) { items.push(base); continue; }
+
+        // 週次信用の最新だけ添付（軽量）
+        let credit = null;
+        try {
+          const raw = await jqFetch("/markets/weekly_margin_interest", { code }, idToken);
+          const rowsC = Array.isArray(raw) ? raw : (raw.weekly_margin_interest || raw.data || []);
+          rowsC.sort((a,b)=> String((b.Date||b.date||"")).localeCompare(String((a.Date||a.date||""))));
+          const r0 = rowsC[0];
+          if (r0) {
+            const buy  = num(r0.BuyingOnMargin || r0.margin_buying || r0.buying_on_margin);
+            const sell = num(r0.SellingOnMargin || r0.margin_selling || r0.selling_on_margin);
+            credit = { date: r0.Date || r0.date, buying: buy, selling: sell, net: buy - sell };
+          }
+        } catch (_) {}
+        items.push({ ...base, credit_latest: credit });
+      } catch (e) {
+        logWarn("portfolio.summary.row_skip", { code, err: String(e).slice(0,300) });
+        items.push({ code, error: "fetch_failed" });
+      }
+    }
+
+    const payload = { count: items.length, items };
+    setCached(cacheKey, payload, 3 * 60 * 60_000);
+    safeJson(res, 200, payload);
+  } catch (e) {
+    safeJson(res, 500, { error: String(e.message || e) });
+  }
+}
+
 // ===== router =====
 export default async function handler(req,res){
   try{
@@ -524,6 +596,8 @@ export default async function handler(req,res){
 
     if (pathOnly === "/api/screen/liquidity" && req.method==="GET") return handleScreenLiquidity(req,res);
     if (pathOnly === "/api/screen/basic" && req.method==="GET") return handleScreenBasic(req,res);
+
+    if (pathOnly === "/api/portfolio/summary" && req.method==="GET") return handlePortfolioSummary(req,res);
 
     res.statusCode=404; res.end("Not Found");
   }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
