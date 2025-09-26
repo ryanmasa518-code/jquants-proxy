@@ -203,7 +203,7 @@ async function handlePricesDaily(req, res) {
     if (hit) return safeJson(res, 200, hit);
 
     const idToken = await ensureIdToken();
-    const data = await jqFetch("/markets/prices/daily_quotes", { code, from: rawFrom, to: rawTo }, idToken);
+    const data = await jqFetch("/prices/daily_quotes", { code, from: rawFrom, to: rawTo }, idToken);
 
     // 念のため基本構造検査（JQは daily_quotes 配列や data 配列で返ることがある）
     const rows = Array.isArray(data) ? data : (data.daily_quotes || data.data || []);
