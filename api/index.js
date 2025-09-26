@@ -166,27 +166,35 @@ function safeParseURL(req) {
   }
 }
 
-async function handlePricesDaily(req, res) {
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try {
-    const url = safeParseURL(req);
-    const code = url.searchParams.get("code");
-    const from = url.searchParams.get("from");
-    const to   = url.searchParams.get("to");
-    if (!code) return safeJson(res, 400, { error: "Missing code" });
+ async function handlePricesDaily(req, res) {
+   if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
+   try {
+     const url = safeParseURL(req);
+     const code = url.searchParams.get("code");
+-    const from = url.searchParams.get("from");
+-    const to   = url.searchParams.get("to");
++    // J-Quantsは YYYYMMDD を要求。受け取った文字列から数字だけ抽出して渡す
++    const rawFrom = url.searchParams.get("from");
++    const rawTo   = url.searchParams.get("to");
++    const from = rawFrom ? rawFrom.replace(/\D/g, "") : undefined; // "2024-01-01" -> "20240101"
++    const to   = rawTo   ? rawTo.replace(/\D/g, "")   : undefined;
 
-    const key = `prices:daily:${code}:${from || ""}:${to || ""}`;
-    const hit = getCached(key);
-    if (hit) return safeJson(res, 200, hit);
+     if (!code) return safeJson(res, 400, { error: "Missing code" });
 
-    const idToken = await ensureIdToken();
-    const data = await jqFetch("/markets/prices/daily_quotes", { code, from, to }, idToken);
-    setCached(key, data, 5 * 60_000);
-    safeJson(res, 200, data);
-  } catch (e) {
-    safeJson(res, 500, { error: String(e.message || e) });
-  }
-}
+     const key = `prices:daily:${code}:${from || ""}:${to || ""}`;
+     const hit = getCached(key);
+     if (hit) return safeJson(res, 200, hit);
+
+     const idToken = await ensureIdToken();
+-    const data = await jqFetch("/markets/prices/daily_quotes", { code, from, to }, idToken);
++    const data = await jqFetch("/markets/prices/daily_quotes", { code, from, to }, idToken);
+     setCached(key, data, 5 * 60_000);
+     safeJson(res, 200, data);
+   } catch (e) {
+     safeJson(res, 500, { error: String(e.message || e) });
+   }
+ }
+
 
 async function handleScreenLiquidity(req, res) {
   if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
