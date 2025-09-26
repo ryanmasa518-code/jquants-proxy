@@ -292,6 +292,8 @@ export default async function handler(req, res) {
 
     if (pathOnly === "/api/health") return handleHealth(req, res);
 
+    if (pathOnly === "/api/debug" && req.method === "GET") return handleDebug(req, res);
+
     if (pathOnly === "/api/auth/refresh" && (req.method === "POST" || req.method === "GET")) {
       return handleAuthRefresh(req, res);
     }
@@ -313,4 +315,20 @@ export default async function handler(req, res) {
   } catch (e) {
     safeJson(res, 500, { error: String(e.message || e) });
   }
+}
+
+async function handleDebug(req, res){
+  const got = (req.headers?.["authorization"]||"").toString();
+  const token = got.startsWith("Bearer ") ? got.slice(7) : "";
+  const masked = token ? token.slice(0,3) + "***" + token.slice(-3) : "";
+  const env = (process.env.PROXY_BEARER || "").toString();
+  const envMasked = env ? env.slice(0,3) + "***" + env.slice(-3) : "";
+  const match = !!env && env === token;
+  safeJson(res, 200, {
+    hasEnv: !!env,
+    gotAuthHeader: !!got,
+    headerMasked: masked,
+    envMasked: envMasked,
+    match
+  });
 }
