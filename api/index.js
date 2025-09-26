@@ -36,11 +36,23 @@ function safeJson(res, status, body) {
 }
 
 function requireProxyBearer(req) {
-  if (!PROXY_BEARER) return true; // 鍵未設定ならスキップ
+  // PROXY_BEARER 未設定ならスキップ
+  if (!PROXY_BEARER) return true;
+
   try {
-    const h = req.headers?.["authorization"] || "";
-    const got = h.startsWith("Bearer ") ? h.slice(7) : "";
-    return got && got === PROXY_BEARER;
+    // 1) Authorization: Bearer xx
+    const h = (req.headers?.["authorization"] || "").toString();
+    const bearer = h.startsWith("Bearer ") ? h.slice(7) : "";
+
+    // 2) X-Proxy-Key: xx（開発用）
+    const xkey = (req.headers?.["x-proxy-key"] || "").toString();
+
+    // 3) ?key=xx（開発用：ブラウザ/簡易テスト向け）
+    const url = safeParseURL(req);
+    const qkey = (url.searchParams.get("key") || "").toString();
+
+    const token = bearer || xkey || qkey;
+    return !!token && token === PROXY_BEARER;
   } catch {
     return false;
   }
@@ -249,7 +261,7 @@ async function handleScreenLiquidity(req, res) {
       if (!code) continue;
       let daily;
       try {
-        daily = await jqFetch("/markets/prices/daily_quotes", { code, from, to }, idToken);
+        daily = await jqFetch("/prices/daily_quotes", { code, from, to }, idToken);
       } catch {
         continue;
       }
