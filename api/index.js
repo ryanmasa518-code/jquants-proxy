@@ -264,11 +264,16 @@ async function handleScreenLiquidity(req, res, url) {
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
-    const p = url.pathname;
+    // 末尾スラッシュを吸収
+    const p = url.pathname.replace(/\/+$/, "");
 
-    // Basic routing
     if (p === "/api/health") return handleHealth(req, res);
-    if (p === "/api/auth/refresh" && req.method === "POST") return handleAuthRefresh(req, res);
+
+    // ← ここを緩める（GET/POST両方許可）
+    if (p === "/api/auth/refresh" && (req.method === "POST" || req.method === "GET")) {
+      return handleAuthRefresh(req, res);
+    }
+
     if (p === "/api/universe/listed" && req.method === "GET") return handleUniverseListed(req, res);
     if (p === "/api/prices/daily" && req.method === "GET") return handlePricesDaily(req, res, url);
     if (p === "/api/screen/liquidity" && req.method === "GET") return handleScreenLiquidity(req, res, url);
