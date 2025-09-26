@@ -4,8 +4,6 @@
 // - Adds simple in-memory caching and rate-friendly backoff
 // - Exposes a tiny set of endpoints for immediate screening use
 
-export const config = { runtime: "nodejs18.x" }; // Vercel Node runtime
-
 const JQ_BASE = "https://api.jquants.com/v1";
 
 // ======== ENV VARS ========
