@@ -85,33 +85,38 @@ async function getRefreshTokenByPassword() {
 }
 
 // refreshToken -> idToken 交換（URLSearchParamsで確実にエンコード）
-async function getIdTokenByRefresh(refreshToken) {
-  const qs = new URLSearchParams({ refreshtoken: refreshToken });
-  const url = `${JQ_BASE}/token/auth_refresh?${qs.toString()}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`auth_refresh failed: ${res.status} ${txt}`);
-  }
-  const data = await res.json();
-  if (!data.idToken) throw new Error("auth_refresh returned no idToken");
-  return data.idToken;
-}
+ async function getIdTokenByRefresh(refreshToken) {
+-  const qs = new URLSearchParams({ refreshtoken: refreshToken });
+-  const url = `${JQ_BASE}/token/auth_refresh?${qs.toString()}`;
+-  const res = await fetch(url);
++  const qs = new URLSearchParams({ refreshtoken: refreshToken });
++  const url = `${JQ_BASE}/token/auth_refresh?${qs.toString()}`;
++  const res = await fetch(url, { method: "POST" }); // ← POST が正解
+   if (!res.ok) {
+     const txt = await res.text().catch(() => "");
+     throw new Error(`auth_refresh failed: ${res.status} ${txt}`);
+   }
+   const data = await res.json();
+   if (!data.idToken) throw new Error("auth_refresh returned no idToken");
+   return data.idToken;
+ }
+
 
 // idToken を確保（期限が近ければ更新）
-async function ensureIdToken() {
-  const now = Date.now();
-  if (cache.idToken && cache.idTokenExpAt - now > 60_000) return cache.idToken;
+ async function ensureIdToken() {
+   const now = Date.now();
+-  if (cache.idToken && cache.idTokenExpAt - now > 60_000) return cache.idToken;
++  if (cache.idToken && cache.idTokenExpAt - now > 60_000) return cache.idToken;
 
-  if (!cache.refreshToken) {
-    cache.refreshToken = ENV_REFRESH_TOKEN || (await getRefreshTokenByPassword());
-  }
-  const idToken = await getIdTokenByRefresh(cache.refreshToken);
-  cache.idToken = idToken;
-  // 公式の有効時間に依存。ここでは 15 分想定で少し余裕を持って運用
-  cache.idTokenExpAt = now + 15 * 60_000;
-  return idToken;
-}
+   if (!cache.refreshToken) {
+     cache.refreshToken = ENV_REFRESH_TOKEN || (await getRefreshTokenByPassword());
+   }
+   const idToken = await getIdTokenByRefresh(cache.refreshToken);
+   cache.idToken = idToken;
+-  cache.idTokenExpAt = now + 15 * 60_000; // 15分想定 → 修正
++  cache.idTokenExpAt = now + 24 * 60 * 60_000; // 24時間に修正（公式仕様）
+   return idToken;
+ }
 
 // --- tiny resp cache helpers ---
 function getCached(key) {
