@@ -1,13 +1,13 @@
-// api/index.js  — 2025-09-27 汎用版・最終形（ESM対応）
-// ポイント：
-// - ESM対応（最後を export default handler）
+// api/index.js  — 2025-09-27 汎用版・最終形（ESM + patch）
+// - ESM対応（export default）
 // - 「7203デフォルト」禁止（code未指定は400）
 // - codes=CSV / 複数クエリ両対応
-// - キャッシュキー＝メソッド＋フルURL
-// - JQ idToken: refreshToken→失敗時は auth_user でフォールバック
+// - キャッシュキー＝メソッド＋フルURL（クエリ含む）
+// - idToken: refreshToken→失敗時は auth_user フォールバック
+// - Market表記ゆれの正規化、上限フィルタでnullは通す、モメンタムnull対応
 
 const JQ_BASE = 'https://api.jquants.com';
-const VERSION = '2025-09-27.final-esm';
+const VERSION = '2025-09-27.final-esm-patch1';
 
 const cache = new Map(); // { key: { ts, ttl, body } }
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
@@ -78,6 +78,22 @@ async function fetchJson(url, options = {}) {
     throw makeError(res.status, msg);
   }
   return res.json();
+}
+
+// ============ Market 正規化 ============
+function normalizeMarketTag(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (!s) return '';
+  if (s.includes('prime') || s.includes('プライム')) return 'Prime';
+  if (s.includes('standard') || s.includes('スタンダード')) return 'Standard';
+  if (s.includes('growth') || s.includes('グロース')) return 'Growth';
+  return s; // それ以外はそのまま（将来の拡張含む）
+}
+
+function matchMarket(itemMarket, wanted) {
+  if (!wanted || wanted === 'All') return true;
+  const m = normalizeMarketTag(itemMarket);
+  return m === normalizeMarketTag(wanted);
 }
 
 // ============ Auth / idToken ============
@@ -289,11 +305,13 @@ async function handleCreditDailyPublic(req, res) {
   safeJson(res, 200, payload);
 }
 
-// --- スクリーニング：流動性（内部処理もESM対応で分離しない） ---
+// --- スクリーニング：流動性（内部処理） ---
 async function handleScreenLiquidityInternal(market, minAvg, days, maxN) {
   const univ = await jqGet('/v1/listed/info');
   let list = Array.isArray(univ.info) ? univ.info : [];
-  if (market !== 'All') list = list.filter(x => (x.market || x.Market || '').includes(market));
+  if (market !== 'All') {
+    list = list.filter(x => matchMarket(x.market || x.Market, market));
+  }
   if (maxN && list.length > maxN * 2) list = list.slice(0, maxN * 2);
 
   async function avgTradingValue(code) {
@@ -333,7 +351,7 @@ async function handleScreenLiquidityInternal(market, minAvg, days, maxN) {
 
 async function handleScreenLiquidity(req, res) {
   const q = getQuery(req);
-  const market = (q.get('market') || 'All').trim(); // All/Prime/Standard/Growth
+  const market = (q.get('market') || 'All').trim(); // All/Prime/Standard/Growth（日本語表記も可）
   const minAvg = Number(q.get('min_avg_trading_value') || 100_000_000);
   const days = Number(q.get('days') || 20);
 
@@ -346,6 +364,7 @@ async function handleScreenLiquidity(req, res) {
   safeJson(res, 200, payload);
 }
 
+// --- スクリーニング：複合 ---
 async function handleScreenBasic(req, res) {
   const q = getQuery(req);
   const market = (q.get('market') || 'All').trim();
@@ -360,8 +379,10 @@ async function handleScreenBasic(req, res) {
   const hit = getCache(key);
   if (hit) return safeJson(res, 200, hit);
 
+  // 1) 流動性フィルター
   const liqResp = await handleScreenLiquidityInternal(market, liquidityMin, 20, 300);
 
+  // 2) 財務・モメンタム
   const pool = 6;
   const out = [];
   let i = 0;
@@ -371,47 +392,50 @@ async function handleScreenBasic(req, res) {
       const it = liqResp.items[idx];
       const code = it.code;
 
-      let per = null, pbr = null, dividend_yield = 0, name = it.name;
+      let per = null, pbr = null, dividend_yield = null, name = it.name;
       try {
         const fs = await jqGet('/v1/fins/statements?code=' + encodeURIComponent(code));
         const st = Array.isArray(fs.statements) ? fs.statements[0] : null;
         if (st) {
-          per = st.per ?? null;
-          pbr = st.pbr ?? null;
-          dividend_yield = st.dividend_yield ?? 0;
+          per = (st.per ?? null);
+          pbr = (st.pbr ?? null);
+          dividend_yield = (st.dividend_yield ?? null);
           name = st.name || name;
         }
       } catch {}
 
-      let mom_3m = 0, mom_6m = 0, mom_12m = 0;
+      // 価格モメンタム（直近3/6/12ヶ月）
+      let mom_3m = null, mom_6m = null, mom_12m = null;
       try {
         const today = new Date();
         const from = new Date(today.getTime() - 380 * 24 * 60 * 60 * 1000);
         const fmt = (d) => d.toISOString().slice(0,10).replace(/-/g,'');
         const prices = await jqGet('/v1/prices/daily_quotes?'+ new URLSearchParams({code, from: fmt(from), to: fmt(today)}).toString());
         const dq = Array.isArray(prices.daily_quotes) ? prices.daily_quotes : [];
-        const closes = dq.map(r => Number(r.Close || r.close)).filter(Boolean);
+        const closes = dq.map(r => Number(r.Close || r.close)).filter(v => Number.isFinite(v));
         if (closes.length > 0) {
           const last = closes[closes.length - 1];
           const idx3 = Math.max(0, closes.length - 63);
           const idx6 = Math.max(0, closes.length - 126);
           const idx12= Math.max(0, closes.length - 252);
-          mom_3m = closes[idx3] ? (last - closes[idx3]) / closes[idx3] : 0;
-          mom_6m = closes[idx6] ? (last - closes[idx6]) / closes[idx6] : 0;
-          mom_12m= closes[idx12]? (last - closes[idx12]) / closes[idx12]: 0;
+          mom_3m = closes[idx3] ? (last - closes[idx3]) / closes[idx3] : null;
+          mom_6m = closes[idx6] ? (last - closes[idx6]) / closes[idx6] : null;
+          mom_12m= closes[idx12]? (last - closes[idx12]) / closes[idx12]: null;
         }
       } catch {}
 
-      if (perLt != null && (per == null || per > perLt)) continue;
-      if (pbrLt != null && (pbr == null || pbr > pbrLt)) continue;
-      if (dyGt  != null && !(dividend_yield >= dyGt)) continue;
-      if (mom3Gt!= null && !(mom_3m >= mom3Gt)) continue;
+      // 3) 条件（nullは通す：値がある時のみ比較）
+      if (perLt != null && per != null && per > perLt) continue;
+      if (pbrLt != null && pbr != null && pbr > pbrLt) continue;
+      if (dyGt  != null && dividend_yield != null && dividend_yield < dyGt) continue;
+      if (mom3Gt!= null && mom_3m != null && mom_3m < mom3Gt) continue;
 
+      // 4) スコア（欠損は0寄与）
       const score = Math.round(
         (per != null ? (50 / Math.max(5, per)) : 0) +
         (pbr != null ? (50 / Math.max(0.5, pbr)) : 0) +
-        (Math.max(0, mom_3m) * 100) +
-        (Math.max(0, dividend_yield) * 300)
+        (Math.max(0, mom_3m ?? 0) * 100) +
+        (Math.max(0, dividend_yield ?? 0) * 300)
       );
 
       out.push({
@@ -431,6 +455,7 @@ async function handleScreenBasic(req, res) {
   safeJson(res, 200, payload);
 }
 
+// --- ポートフォリオ要約 ---
 async function handlePortfolioSummary(req, res) {
   const q = getQuery(req);
   const codes = parseCodes(q);
@@ -448,7 +473,7 @@ async function handlePortfolioSummary(req, res) {
       const idx = i++;
       const code = codes[idx];
 
-      let close = null, per = null, pbr = null, dividend_yield = 0, eps_ttm = null, bps = null, dps = null;
+      let close = null, per = null, pbr = null, dividend_yield = null, eps_ttm = null, bps = null, dps = null;
       try {
         const today = new Date();
         const from = new Date(today.getTime() - 70 * 24 * 60 * 60 * 1000);
@@ -464,7 +489,7 @@ async function handlePortfolioSummary(req, res) {
         if (st) {
           per = st.per ?? null;
           pbr = st.pbr ?? null;
-          dividend_yield = st.dividend_yield ?? 0;
+          dividend_yield = st.dividend_yield ?? null;
           eps_ttm = st.eps_ttm ?? st.eps ?? null;
           bps = st.bps ?? null;
           dps = st.dps ?? st.dividend ?? null;
