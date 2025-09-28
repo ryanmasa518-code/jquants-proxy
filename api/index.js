@@ -693,7 +693,8 @@ export default async function handler(req, res) {
         const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
 
         // ★未定義対策
-        const fastParam = (url.searchParams.get("fast") || "").toLowerCase();
+        // 既定は “軽量” とする（指定が無ければ fast=1 扱い）
+        const fastParam = (url.searchParams.get("fast") || "1").toLowerCase();
         const fast = (fastParam === "1" || fastParam === "true");
 
         // 既定＝最新1日で近似（重い“avg”はクエリ指定時のみ）
@@ -725,8 +726,8 @@ export default async function handler(req, res) {
           DBG.universe = raw.length;
         }
 
-        // モメンタムが必要か（条件に mom3m_gt があれば fast でも計算）
-        const needMomentum = (mom3m_gt != null) ? true : !fast;
+        // ★モメンタムは「条件があるときだけ」計算（なければ常にスキップ）
+        const needMomentum = (mom3m_gt != null);
 
         // 事前フェッチ（時間オーバーなら即返す）
         const [listedMap, liq, momSnaps] = await Promise.all([
