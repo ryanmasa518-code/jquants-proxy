@@ -650,6 +650,40 @@ export default async function handler(req, res) {
       return json(res, 200, { code: codeStr(code), count: items.length, items });
     }
 
+    // /api/universe: コードをページングで返す（軽量）
+    if (path === "/api/universe" && method === "GET") {
+      try {
+        const market = url.searchParams.get("market") || "All";
+        const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
+        const offset = Math.max(0, toInt(url.searchParams.get("offset")) ?? 0);
+        const limit = Math.min(200, Math.max(1, toInt(url.searchParams.get("limit")) ?? 150));
+
+        // 既定は軽量：直近1日
+        const { avgTV } = await buildLiquidityAndClose(5, idTokenOverride, "latest");
+        const listedMap = await getListedMap(idTokenOverride);
+
+        // 市場＆流動性で母集団化 → TV降順
+        const rows = [];
+        for (const [code, tv] of avgTV.entries()) {
+          if (!Number.isFinite(tv) || tv < liquidity_min) continue;
+          const meta = listedMap.get(code) || { marketJa: "" };
+          if (!marketMatch(market, meta.marketJa || "")) continue;
+          rows.push([code, tv]);
+        }
+        rows.sort((a, b) => b[1] - a[1]);
+
+        const page = rows.slice(offset, offset + limit).map(r => r[0]);
+        return json(res, 200, {
+          total: rows.length,
+          offset,
+          limit,
+          codes: page
+        });
+      } catch (e) {
+        return json(res, 200, { total: 0, offset: 0, limit: 0, codes: [], error: String(e && e.message || e) });
+      }
+    }
+
     // /api/screen/liquidity（fast=1 で軽量取得）
     if (path === "/api/screen/liquidity" && method === "GET") {
       const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
