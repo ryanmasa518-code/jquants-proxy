@@ -689,7 +689,11 @@ export default async function handler(req, res) {
         const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
         const per_lt = url.searchParams.get("per_lt") != null ? Number(url.searchParams.get("per_lt")) : null;
         const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
-        const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
+        let div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
+        // フォールバック: 1〜100 は “%” と解釈して 100 で割る（例: 2.5 → 0.025）
+        if (div_yield_gt != null && Number.isFinite(div_yield_gt) && div_yield_gt > 1 && div_yield_gt <= 100) {
+          div_yield_gt = div_yield_gt / 100;
+        }
         const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
 
         // ★未定義対策
