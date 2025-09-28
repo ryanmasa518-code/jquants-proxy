@@ -1,20 +1,12 @@
 // api/index.js
-// J-Quants JP Proxy (Screening) — full replacement
+// J-Quants JP Proxy (Screening) — full replacement (paging + fast mode + codes[] fix)
 // 必須Env: PROXY_BEARER
-// どちらか: (A) JQ_REFRESH_TOKEN  または  (B) JQ_EMAIL + JQ_PASSWORD
+// どちらか: (A) JQ_REFRESH_TOKEN  または  (B) JQ_MAIL + JQ_PASSWORD
 // 任意Env: LOG_LEVEL=debug で簡易デバッグログ
-//
-// 実装の要点:
-// - /token/auth_user (週1): refreshToken を取得してキャッシュ（メール/パスワードでの自動ブートストラップ）
-// - /token/auth_refresh (24h): idToken を取得してキャッシュ
-// - 日次株価は TurnoverValue を採用、信用残は Long/Short* の正式キーに対応
-// - 市場は MarketCodeName（プライム/スタンダード/グロース）を採用
-// - CORS 設定あり、プロキシ用 Bearer を各APIで要求
 
 const JQ_BASE = "https://api.jquants.com/v1";
-const VERSION = "1.0.9-full";
+const VERSION = "1.1.0-full-paging-fast";
 
-// ———————————————————————— ユーティリティ
 const isDebug = () => (process.env.LOG_LEVEL || "").toLowerCase() === "debug";
 const dlog = (...args) => { if (isDebug()) console.log("[DEBUG]", ...args); };
 
@@ -36,9 +28,9 @@ function toNum(x) {
 function codeStr(x) { return String(x || "").padStart(4, "0"); }
 function normDateStr(s) { return typeof s === "string" ? s : String(s || ""); }
 
-// ———————————————————————— 認証（refreshToken / idToken キャッシュ）
+// -------------------- 認証（refreshToken / idToken キャッシュ）
 let REFRESH_TOKEN = process.env.JQ_REFRESH_TOKEN || null;
-let REFRESH_TOKEN_EXP_AT = REFRESH_TOKEN ? 0 : 0; // 環境変数の場合は期限不明(0=未知)
+let REFRESH_TOKEN_EXP_AT = REFRESH_TOKEN ? 0 : 0; // env提供時は有効期限不明
 let ID_TOKEN = null;
 let ID_TOKEN_EXP_AT = 0;
 
@@ -58,11 +50,11 @@ function requireProxyAuth(req, res) {
   return true;
 }
 
-// refreshToken をメール/パスワードから取得（週1回想定）
+// /token/auth_user（週1発行想定）
 async function fetchRefreshTokenFromUserPass() {
-  const mail = process.env.JQ_EMAIL;
+  const mail = process.env.JQ_MAIL;
   const pass = process.env.JQ_PASSWORD;
-  if (!mail || !pass) throw new Error("Missing JQ_EMAIL / JQ_PASSWORD");
+  if (!mail || !pass) throw new Error("Missing JQ_MAIL / JQ_PASSWORD");
 
   const r = await fetch(`${JQ_BASE}/token/auth_user`, {
     method: "POST",
@@ -73,10 +65,9 @@ async function fetchRefreshTokenFromUserPass() {
   if (!r.ok || !j.refreshToken) {
     throw new Error(`auth_user failed: ${r.status} ${JSON.stringify(j)}`);
   }
-  // 1週間有効（安全側に -10分）
   REFRESH_TOKEN = j.refreshToken;
-  REFRESH_TOKEN_EXP_AT = Date.now() + 7 * 24 * 60 * 60 * 1000 - 10 * 60 * 1000;
-  dlog("refreshToken issued (masked)");
+  REFRESH_TOKEN_EXP_AT = Date.now() + 7 * 24 * 60 * 60 * 1000 - 10 * 60 * 1000; // 1週間 -10分
+  dlog("refreshToken issued");
   return REFRESH_TOKEN;
 }
 function refreshTokenValid() {
@@ -85,12 +76,11 @@ function refreshTokenValid() {
 let inflightGetRT = null;
 async function ensureRefreshToken() {
   if (refreshTokenValid()) return REFRESH_TOKEN;
-  if (inflightGetRT) return inflightGetRT; // 同時実行デデュープ
+  if (inflightGetRT) return inflightGetRT;
   inflightGetRT = (async () => {
     if (process.env.JQ_REFRESH_TOKEN && !REFRESH_TOKEN) {
-      // env に固定が入っている場合はそれを採用（期限は未知）
       REFRESH_TOKEN = process.env.JQ_REFRESH_TOKEN;
-      REFRESH_TOKEN_EXP_AT = 0;
+      REFRESH_TOKEN_EXP_AT = 0; // 不明
       return REFRESH_TOKEN;
     }
     return await fetchRefreshTokenFromUserPass();
@@ -100,38 +90,32 @@ async function ensureRefreshToken() {
 
 let inflightGetID = null;
 async function refreshIdToken(maybeRefreshToken) {
-  // 有効な refreshToken を確保
   const refreshToken = maybeRefreshToken || await ensureRefreshToken();
-
   const url = `${JQ_BASE}/token/auth_refresh?refreshtoken=${encodeURIComponent(refreshToken)}`;
   const r = await fetch(url, { method: "POST" });
   const t = await r.json().catch(() => ({}));
 
   if (!r.ok || !t.idToken) {
-    // refreshToken が期限切れ/無効など → 再発行して再試行
     REFRESH_TOKEN = null; REFRESH_TOKEN_EXP_AT = 0;
     const rt2 = await ensureRefreshToken();
     const r2 = await fetch(`${JQ_BASE}/token/auth_refresh?refreshtoken=${encodeURIComponent(rt2)}`, { method: "POST" });
     const t2 = await r2.json().catch(() => ({}));
-    if (!r2.ok || !t2.idToken) {
-      throw new Error(`auth_refresh failed: ${r2.status} ${JSON.stringify(t2)}`);
-    }
+    if (!r2.ok || !t2.idToken) throw new Error(`auth_refresh failed: ${r2.status} ${JSON.stringify(t2)}`);
     ID_TOKEN = t2.idToken;
   } else {
     ID_TOKEN = t.idToken;
   }
-  // 24h有効（安全側 -5分）
-  ID_TOKEN_EXP_AT = Date.now() + 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
+  ID_TOKEN_EXP_AT = Date.now() + 24 * 60 * 60 * 1000 - 5 * 60 * 1000; // 24h -5分
   return { idToken: ID_TOKEN, expAt: ID_TOKEN_EXP_AT };
 }
 async function ensureIdToken() {
   if (ID_TOKEN && msUntilExp() > 0) return ID_TOKEN;
-  if (inflightGetID) return inflightGetID; // 同時実行デデュープ
+  if (inflightGetID) return inflightGetID;
   inflightGetID = (async () => (await refreshIdToken()).idToken)();
   try { return await inflightGetID; } finally { inflightGetID = null; }
 }
 
-// 任意: クライアントが idToken を直接渡してくる場合に優先使用
+// 任意：クライアントが直渡しする場合
 function readIdTokenOverride(req) {
   const h = req.headers["x-id-token"] || req.headers["X-ID-TOKEN"];
   return typeof h === "string" && h.trim() ? h.trim() : null;
@@ -150,7 +134,20 @@ async function jqGET(pathWithQuery, idTokenOverride) {
   return body;
 }
 
-// ———————————————————————— JQ データマッピング
+// ★ ページングを最後まで取り切る共通ヘルパー
+async function jqGETAll(path, idTokenOverride) {
+  let out = [];
+  let next = null;
+  do {
+    const url = next ? `${path}&pagination_key=${encodeURIComponent(next)}` : path;
+    const j = await jqGET(url, idTokenOverride);
+    if (Array.isArray(j.daily_quotes)) out = out.concat(j.daily_quotes);
+    next = j.pagination_key || null;
+  } while (next);
+  return out;
+}
+
+// -------------------- マッピング
 function mapDailyQuote(rec) {
   return {
     date: normDateStr(pick(rec, "Date", "date")),
@@ -182,11 +179,11 @@ function mapDailyPublic(rec) {
     buying: Number.isFinite(buy) ? buy : 0,
     selling: Number.isFinite(sell) ? sell : 0,
     net: (Number.isFinite(buy) && Number.isFinite(sell)) ? (buy - sell) : null,
-    margin_rate: (r != null ? (r > 1 ? r / 100 : r) : null) // ％で来た場合を 0-1 に正規化
+    margin_rate: (r != null ? (r > 1 ? r / 100 : r) : null) // ％→0-1正規化
   };
 }
 
-// ———————————————————————— 上場銘柄/営業日/株価ユーティリティ
+// -------------------- 上場銘柄/営業日/株価ユーティリティ
 async function getListedMap(idTokenOverride) {
   const j = await jqGET(`/listed/info`, idTokenOverride);
   const info = j.info || [];
@@ -228,8 +225,9 @@ async function getLatestTradingDate(idTokenOverride) {
   return d[0];
 }
 async function fetchDailyQuotesByDate(dateStr, idTokenOverride) {
-  const j = await jqGET(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`, idTokenOverride);
-  return (j.daily_quotes || []).map(mapDailyQuote);
+  // ★ ページングを取り切る
+  const arr = await jqGETAll(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`, idTokenOverride);
+  return arr.map(mapDailyQuote);
 }
 
 // 直近N営業日の平均売買代金（TurnoverValue）＋最新終値
@@ -256,7 +254,7 @@ async function buildLiquidityAndClose(days = 20, idTokenOverride) {
   return { avgTV, latestClose: lastDayClose };
 }
 
-// 3/6/12か月モメンタム（営業日ベースの近似）
+// 3/6/12か月モメンタム（営業日ベース近似）
 async function buildMomentumSnapshots(idTokenOverride) {
   const dates = await getRecentTradingDates(260, idTokenOverride);
   if (dates.length === 0) return { d0: new Map() };
@@ -304,12 +302,12 @@ function summarizeFins(statements) {
   const eps_ttm = epsVals.length ? epsVals.reduce((x, y) => x + y, 0) : null;
   const bps = toNum(pick(items[0] || {}, "BookValuePerShare", "bps", "BPS")) ?? null;
   const dps = toNum(pick(items[0] || {}, "ResultDividendPerShareAnnual", "ForecastDividendPerShareAnnual", "dps", "DPS")) ?? null;
-  const roe = toNum(pick(items[0] || {}, "ROE", "roe")); // 無い場合多い
+  const roe = toNum(pick(items[0] || {}, "ROE", "roe"));
   const roa = toNum(pick(items[0] || {}, "ROA", "roa"));
   return { eps_ttm, bps, dps, roe, roa };
 }
 
-// ———————————————————————— ルーター
+// -------------------- ルーター
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
@@ -326,7 +324,7 @@ export default async function handler(req, res) {
     }
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    // /api/health は無認可でOK
+    // /api/health (no auth)
     if (path === "/api/health" && method === "GET") {
       return json(res, 200, {
         ok: true,
@@ -336,10 +334,10 @@ export default async function handler(req, res) {
       });
     }
 
-    // それ以外はプロキシ用ベアラー必須
+    // それ以外はプロキシ用Bearer必須
     if (!requireProxyAuth(req, res)) return;
 
-    // idToken更新（内部キャッシュ）: POST
+    // /api/auth/refresh
     if (path === "/api/auth/refresh" && method === "POST") {
       const body = typeof req.body === "object" ? req.body : {};
       const override = body?.refreshToken || body?.refreshtoken;
@@ -347,7 +345,7 @@ export default async function handler(req, res) {
       return json(res, 200, out);
     }
 
-    // 日次株価（JQのレスポンスをほぼ素通し）
+    // /api/prices/daily
     if (path === "/api/prices/daily" && method === "GET") {
       const code = url.searchParams.get("code");
       const from = url.searchParams.get("from");
@@ -358,10 +356,10 @@ export default async function handler(req, res) {
       if (from) q.set("from", from);
       if (to) q.set("to", to);
       const j = await jqGET(`/prices/daily_quotes?${q.toString()}`, idTokenOverride);
-      return json(res, 200, j);
+      return json(res, 200, j); // JQの形式のまま返す
     }
 
-    // 財務サマリ
+    // /api/fins/statements
     if (path === "/api/fins/statements" && method === "GET") {
       const code = url.searchParams.get("code");
       if (!code) return json(res, 400, { error: "code is required" });
@@ -399,7 +397,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // 週次信用残
+    // /api/credit/weekly
     if (path === "/api/credit/weekly" && method === "GET") {
       const code = url.searchParams.get("code");
       const weeks = Math.max(4, toInt(url.searchParams.get("weeks")) || 26);
@@ -424,12 +422,13 @@ export default async function handler(req, res) {
       return json(res, 200, { code: codeStr(code), count: items.length, metrics, items });
     }
 
-    // 日々公表信用残
+    // /api/credit/daily_public
     if (path === "/api/credit/daily_public" && method === "GET") {
       const code = url.searchParams.get("code");
       const days = Math.max(7, toInt(url.searchParams.get("days")) || 60);
       if (!code) return json(res, 400, { error: "code is required" });
 
+      // ※対象銘柄でなければ空で返るのが正常。日付幅は広めに。
       const today = new Date();
       const to = today.toISOString().slice(0, 10);
       const from = new Date(today.getTime() - (days + 20) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -442,13 +441,19 @@ export default async function handler(req, res) {
       return json(res, 200, { code: codeStr(code), count: items.length, items });
     }
 
-    // 流動性プリフィルタ（平均売買代金）
+    // /api/screen/liquidity（fast=1 で軽量取得）
     if (path === "/api/screen/liquidity" && method === "GET") {
       const market = url.searchParams.get("market") || "All";
       const minAvg = toInt(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
-      const days = toInt(url.searchParams.get("days")) ?? 20;
+      const days = toInt(url.searchParams.get("days"));
+      const fast = toInt(url.searchParams.get("fast")) === 1;
+      const daysEff = (days != null ? days : (fast ? 5 : 20));
 
-      const [listedMap, liq] = await Promise.all([getListedMap(idTokenOverride), buildLiquidityAndClose(days, idTokenOverride)]);
+      const [listedMap, liq] = await Promise.all([
+        getListedMap(idTokenOverride),
+        buildLiquidityAndClose(daysEff, idTokenOverride)
+      ]);
+
       const out = [];
       for (const [code, avg_trading_value] of liq.avgTV.entries()) {
         const meta = listedMap.get(code) || { name: "", marketJa: "" };
@@ -460,7 +465,7 @@ export default async function handler(req, res) {
       return json(res, 200, { count: out.length, items: out });
     }
 
-    // 総合スクリーナー
+    // /api/screen/basic（fast=1 でモメンタム計算を省略 → 安定動作確認用）
     if (path === "/api/screen/basic" && method === "GET") {
       const market = url.searchParams.get("market") || "All";
       const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
@@ -469,11 +474,12 @@ export default async function handler(req, res) {
       const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
       const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
       const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
+      const fast = toInt(url.searchParams.get("fast")) === 1;
 
       const [listedMap, { avgTV, latestClose }, momSnaps] = await Promise.all([
         getListedMap(idTokenOverride),
-        buildLiquidityAndClose(20, idTokenOverride),
-        buildMomentumSnapshots(idTokenOverride),
+        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride),
+        (fast ? Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() }) : buildMomentumSnapshots(idTokenOverride)),
       ]);
 
       const items = [];
@@ -482,12 +488,11 @@ export default async function handler(req, res) {
         if (!marketMatch(market, meta.marketJa)) continue;
         if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
 
-        const mom_3m = calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code));
-        const mom_6m = calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code));
-        const mom_12m = calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code));
+        const mom_3m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code)));
+        const mom_6m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code)));
+        const mom_12m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code)));
         if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
 
-        // バリュー系（必要時だけ statements を呼ぶ）
         let per = null, pbr = null, dividend_yield = null;
         if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
           try {
@@ -526,13 +531,20 @@ export default async function handler(req, res) {
       return json(res, 200, { count: Math.min(items.length, limit), items: items.slice(0, limit) });
     }
 
-    // ポートフォリオ・サマリー
+    // /api/portfolio/summary（codes の explode/非explode 両対応）
     if (path === "/api/portfolio/summary" && method === "GET") {
       const codesParam = url.searchParams.get("codes");
+      const codesMulti = url.searchParams.getAll("codes"); // explode=true 互換
       const with_credit = toInt(url.searchParams.get("with_credit")) === 1;
-      if (!codesParam) return json(res, 400, { error: "codes is required (comma-separated)" });
 
-      const codes = codesParam.split(",").map(s => codeStr(s.trim())).filter(Boolean);
+      const rawList = [
+        ...(codesParam ? codesParam.split(",") : []),
+        ...((codesMulti.length > 1) ? codesMulti : [])
+      ].map(s => String(s).trim()).filter(Boolean);
+
+      if (rawList.length === 0) return json(res, 400, { error: "codes is required" });
+      const codes = rawList.map(codeStr);
+
       const [listedMap, latestDate] = await Promise.all([getListedMap(idTokenOverride), getLatestTradingDate(idTokenOverride)]);
       const dq = await fetchDailyQuotesByDate(latestDate, idTokenOverride);
       const closeMap = new Map(dq.map(it => [codeStr(it.code), it.close]));
