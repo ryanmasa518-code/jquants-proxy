@@ -292,31 +292,102 @@ function calcReturn(nowClose, pastClose) {
 }
 
 // statements（EPS/BPS/DPS の簡易要約）
-async function fetchFinsStatementsByCode(code, idTokenOverride) {
-  const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`, idTokenOverride);
-  return j.statements || [];
+function pickNumAny(obj, keys) {
+  for (const k of keys) {
+    const v = obj && obj[k];
+    if (v === "-" || v === "*" || v === "" || v == null) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
 }
+
 function summarizeFins(statements) {
   if (!Array.isArray(statements) || statements.length === 0) {
     return { eps_ttm: null, bps: null, dps: null, roe: null, roa: null };
   }
+  // 開示日降順
   const items = [...statements].sort((a, b) => {
-    return normDateStr(pick(b, "DisclosedDate", "disclosedDate"))
-         .localeCompare(normDateStr(pick(a, "DisclosedDate", "disclosedDate")));
+    const da = String(a.DisclosedDate || a.disclosedDate || "");
+    const db = String(b.DisclosedDate || b.disclosedDate || "");
+    return db.localeCompare(da);
   });
 
+  // ---- EPS (TTM) ----
   const epsVals = [];
   for (const it of items) {
-    const e = toNum(pick(it, "EarningsPerShare", "eps", "EPS"));
+    const e = pickNumAny(it, ["EarningsPerShare", "EPS", "eps"]);
     if (e != null) epsVals.push(e);
     if (epsVals.length >= 4) break;
   }
-  const eps_ttm = epsVals.length ? epsVals.reduce((x, y) => x + y, 0) : null;
-  const bps = toNum(pick(items[0] || {}, "BookValuePerShare", "bps", "BPS")) ?? null;
-  const dps = toNum(pick(items[0] || {}, "ResultDividendPerShareAnnual", "ForecastDividendPerShareAnnual", "dps", "DPS")) ?? null;
-  const roe = toNum(pick(items[0] || {}, "ROE", "roe"));
-  const roa = toNum(pick(items[0] || {}, "ROA", "roa"));
+  const eps_ttm = epsVals.length ? epsVals.reduce((a, b) => a + b, 0) : null;
+
+  // ---- BPS ----
+  // 1) per-share の直接項目を優先
+  let bps = pickNumAny(items[0] || {}, ["BookValuePerShare", "NetAssetsPerShare", "BPS", "bps"]);
+  // 2) 無ければ Equity / Shares で算出（直近期）
+  if (bps == null) {
+    const latest = items[0] || {};
+    const equity = pickNumAny(latest, [
+      "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
+    ]);
+    const shares = pickNumAny(latest, [
+      "NumberOfIssuedAndOutstandingSharesAtEndOfFiscalYearIncludingTreasuryStock",
+      "IssuedShares", "CommonSharesOutstanding", "NumberOfShares"
+    ]);
+    if (equity != null && shares != null && shares > 0) bps = equity / shares;
+  }
+
+  // ---- DPS ----
+  // 優先度: 実績 > 予想。無ければ四半期の CashDividendsPaidPerShare 合算
+  let dps = pickNumAny(items[0] || {}, [
+    "ResultDividendPerShareAnnual",
+    "ForecastDividendPerShareAnnual",
+    "DividendPerShare",
+    "DPS", "dps"
+  ]);
+  if (dps == null) {
+    let tmp = 0, cnt = 0;
+    for (let i = 0; i < Math.min(4, items.length); i++) {
+      const v = pickNumAny(items[i], ["CashDividendsPaidPerShare"]);
+      if (v != null) { tmp += v; cnt++; }
+    }
+    if (cnt > 0) dps = tmp;
+  }
+
+  // ---- ROE / ROA（近似：TTM利益 / (期首・期末の平均残高)）----
+  let roe = null, roa = null;
+  const eq_end = pickNumAny(items[0] || {}, [
+    "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
+  ]);
+  const ta_end = pickNumAny(items[0] || {}, ["TotalAssets"]);
+  const eq_begin = pickNumAny(items[1] || {}, [
+    "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
+  ]);
+  const ta_begin = pickNumAny(items[1] || {}, ["TotalAssets"]);
+
+  // 親会社株主帰属利益（TTM）
+  let ni_ttm = null;
+  let sumNI = 0, seen = 0;
+  for (let i = 0; i < Math.min(4, items.length); i++) {
+    const ni = pickNumAny(items[i], [
+      "ProfitLossAttributableToOwnersOfParent",
+      "NetIncome", "NetIncomeAttributableToOwnersOfParent"
+    ]);
+    if (ni != null) { sumNI += ni; seen++; }
+  }
+  if (seen > 0) ni_ttm = sumNI;
+
+  const eq_avg = (eq_end != null && eq_begin != null) ? (eq_end + eq_begin) / 2 : null;
+  const ta_avg = (ta_end != null && ta_begin != null) ? (ta_end + ta_begin) / 2 : null;
+  if (ni_ttm != null && eq_avg && eq_avg !== 0) roe = ni_ttm / eq_avg;
+  if (ni_ttm != null && ta_avg && ta_avg !== 0) roa = ni_ttm / ta_avg;
+
   return { eps_ttm, bps, dps, roe, roa };
+}
+async function fetchFinsStatementsByCode(code, idTokenOverride) {
+  const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`, idTokenOverride);
+  return j.statements || [];
 }
 
 // -------------------- ルーター
