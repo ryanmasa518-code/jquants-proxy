@@ -231,15 +231,25 @@ async function getListedMap(idTokenOverride) {
   }
   return m;
 }
-function marketMatch(marketParam, marketJa) {
+function marketMatch(marketParam, marketNameRaw) {
   if (!marketParam || marketParam === "All") return true;
-  const want = (marketParam || "").toLowerCase();
-  const ja = (marketJa || "").toLowerCase();
-  if (want === "prime")    return ja.includes("プライム");
-  if (want === "standard") return ja.includes("スタンダード");
-  if (want === "growth")   return ja.includes("グロース");
+
+  const want = String(marketParam).trim().toLowerCase();
+  const s = String(marketNameRaw || "").trim().toLowerCase();
+
+  // 日本語・英語双方の代表語／略語に対応
+  const PRIME = ["プライム", "prime", "tse prime", "prime market"];
+  const STANDARD = ["スタンダード", "standard", "tse standard", "standard market"];
+  const GROWTH = ["グロース", "growth", "tse growth", "growth market"];
+
+  if (want === "prime")    return s === "" ? true : PRIME.some(k => s.includes(k));
+  if (want === "standard") return s === "" ? true : STANDARD.some(k => s.includes(k));
+  if (want === "growth")   return s === "" ? true : GROWTH.some(k => s.includes(k));
+
+  // 未知指定は通す（落とし過ぎ防止）
   return true;
 }
+
 
 async function getRecentTradingDates(nDays, idTokenOverride) {
   const today = new Date();
@@ -790,6 +800,7 @@ export default async function handler(req, res) {
           });
           kept++;
           if (items.length >= limit) break; // 目的件数が揃ったら終了
+          
         }
 
         items.sort((a, b) => b.score - a.score);
