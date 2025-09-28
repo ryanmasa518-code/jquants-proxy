@@ -668,101 +668,140 @@ export default async function handler(req, res) {
       return json(res, 200, { count: out.length, items: out });
     }
 
-    // /api/screen/basic（fast=1 で軽量。mom3m_gt を指定したらモメンタムだけ有効化）
+    // /api/screen/basic（時間予算つき・途中でも返す・安全デバッグ）
     if (path === "/api/screen/basic" && method === "GET") {
-      const market = url.searchParams.get("market") || "All";
-      const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
-      const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
-      const per_lt = url.searchParams.get("per_lt") != null ? Number(url.searchParams.get("per_lt")) : null;
-      const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
-      const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
-      const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
+      // 常に 200 で {count, items} を返す（コネクタ側で {} にならないように）
+      const safeReturn = (payload) => json(res, 200, Object.assign({ count: 0, items: [] }, payload));
 
-      // ★ここが重要：fast を必ず定義（未指定なら false）
-      const fastParam = (url.searchParams.get("fast") || "").toLowerCase();
-      const fast = (fastParam === "1" || fastParam === "true");
+      try {
+        const market = url.searchParams.get("market") || "All";
+        const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
+        const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
+        const per_lt = url.searchParams.get("per_lt") != null ? Number(url.searchParams.get("per_lt")) : null;
+        const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
+        const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
+        const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
 
-      // 流動性の算出モード（既定: latest=直近1日で近似）
-      const liqMode = (url.searchParams.get("liquidity_mode") || "latest").toLowerCase();
+        // ★未定義対策
+        const fastParam = (url.searchParams.get("fast") || "").toLowerCase();
+        const fast = (fastParam === "1" || fastParam === "true");
 
-      // mom3m_gt を使うならモメンタムが必要。fast 指定でもモメンタムだけは計算する
-      const needMomentum = (mom3m_gt != null) ? true : !fast;
+        // 既定＝最新1日で近似（重い“avg”はクエリ指定時のみ）
+        const liqMode = (url.searchParams.get("liquidity_mode") || "latest").toLowerCase();
 
-      // 任意の対象銘柄リスト（universe=カンマ区切り or 複数指定）
-      const uniParam = url.searchParams.get("universe");
-      const uniMulti = url.searchParams.getAll("universe");
-      let allowSet = null;
-      if (uniParam || (uniMulti && uniMulti.length > 1)) {
-        const raw = [
-          ...(uniParam ? uniParam.split(",") : []),
-          ...((uniMulti.length > 1) ? uniMulti : [])
-        ].map(s => codeStr(String(s).trim())).filter(Boolean);
-        allowSet = new Set(raw);
-      }
+        // デバッグ
+        const debug = (url.searchParams.get("debug") || "") === "1";
+        const t0 = Date.now();
+        const DBG = { phase: "start" };
 
-      // ページング制御（あれば引き回し）
-      const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
-      const sleepMs  = toInt(url.searchParams.get("sleep_ms"))  ?? undefined;
-      const jqAllOpt = { maxPages, sleepMs };
+        // ★時間予算（ms）— 既定 25s。必要に応じて query で調整可
+        const budgetMs = toInt(url.searchParams.get("budget_ms")) ?? 25000;
+        const deadline = t0 + Math.max(5000, budgetMs); // 最低5秒は確保
+        const timeLeft = () => deadline - Date.now();
 
-      const [listedMap, liq, momSnaps] = await Promise.all([
-        getListedMap(idTokenOverride),
-        // fast のときは days=5・latest 近似が軽い。avg にしたい時はクエリで上書き可
-        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride, liqMode),
-        (needMomentum ? buildMomentumSnapshots(idTokenOverride) : Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() })),
-      ]);
+        // ★財務走査の最大件数（重さ抑制）
+        const MAX_SCAN = toInt(url.searchParams.get("max_scan")) ?? 500;
 
-      const items = [];
-      for (const [code, avg_trading_value] of liq.avgTV.entries()) {
-        if (allowSet && !allowSet.has(code)) continue;
-
-        const meta = listedMap.get(code) || { name: "", marketJa: "" };
-        if (!marketMatch(market, meta.marketJa)) continue;
-        if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
-
-        // モメンタム（必要なときだけ計算）
-        const mom_3m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code)) : null;
-        const mom_6m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code)) : null;
-        const mom_12m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code)) : null;
-        if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
-
-        // バリュー系（必要な場合だけ取りに行く）
-        let per = null, pbr = null, dividend_yield = null;
-        if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
-          try {
-            const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
-            const s = summarizeFins(stmts);
-            const close = liq.latestClose.get(code);
-            if (Number.isFinite(close)) {
-              if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
-              if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
-              if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
-            }
-            if (per_lt != null && !(per != null && per < per_lt)) continue;
-            if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
-            if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
-          } catch (e) {
-            // 財務が取れない銘柄はスキップ（落とさない）
-            continue;
-          }
+        // 任意：universe で銘柄事前絞り込み
+        const uniParam = url.searchParams.get("universe");
+        const uniMulti = url.searchParams.getAll("universe");
+        let allowSet = null;
+        if (uniParam || (uniMulti && uniMulti.length > 1)) {
+          const raw = [
+            ...(uniParam ? uniParam.split(",") : []),
+            ...((uniMulti.length > 1) ? uniMulti : [])
+          ].map(s => codeStr(String(s).trim())).filter(Boolean);
+          allowSet = new Set(raw);
+          DBG.universe = raw.length;
         }
 
-        const liqScore = Math.log10(Math.max(1, avg_trading_value));
-        const momScore = (mom_3m == null ? 0 : mom_3m * 100);
-        const score = Math.round(10 * (liqScore + momScore));
+        // モメンタムが必要か（条件に mom3m_gt があれば fast でも計算）
+        const needMomentum = (mom3m_gt != null) ? true : !fast;
 
-        items.push({
-          code,
-          name: meta.name,
-          per, pbr, dividend_yield,
-          mom_3m, mom_6m, mom_12m,
-          avg_trading_value: Math.round(avg_trading_value),
-          score
+        // 事前フェッチ（時間オーバーなら即返す）
+        const [listedMap, liq, momSnaps] = await Promise.all([
+          getListedMap(idTokenOverride).then(v => (DBG.listed = true, v)),
+          buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride, liqMode).then(v => (DBG.liq = true, v)),
+          (needMomentum ? buildMomentumSnapshots(idTokenOverride) : Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() }))
+            .then(v => (DBG.mom = needMomentum, v)),
+        ]);
+
+        if (timeLeft() <= 0) {
+          if (debug) return safeReturn({ _debug: Object.assign(DBG, { reason: "budget_exhausted_preloop", ms: Date.now() - t0 }) });
+          return safeReturn({});
+        }
+
+        const items = [];
+        let processed = 0, kept = 0, scanned = 0;
+        const avgTV = liq.avgTV;
+        DBG.candidates = avgTV.size;
+
+        for (const [code, avg_trading_value] of avgTV.entries()) {
+          processed++;
+          if (processed % 200 === 0 && timeLeft() <= 0) break; // 時間切れなら終了
+
+          if (allowSet && !allowSet.has(code)) continue;
+
+          const meta = listedMap.get(code) || { name: "", marketJa: "" };
+          if (!marketMatch(market, meta.marketJa)) continue;
+          if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
+
+          // モメンタム（必要なときのみ）
+          const mom_3m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code)) : null;
+          const mom_6m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code)) : null;
+          const mom_12m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code)) : null;
+          if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
+
+          // バリュー条件がある場合のみ財務を取りに行く。時間とスキャン上限で打ち切り
+          let per = null, pbr = null, dividend_yield = null;
+          if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
+            if (timeLeft() <= 0 || scanned >= MAX_SCAN) break;
+            scanned++;
+
+            try {
+              const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
+              const s = summarizeFins(stmts);
+              const close = liq.latestClose.get(code);
+              if (Number.isFinite(close)) {
+                if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
+                if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
+                if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
+              }
+              if (per_lt != null && !(per != null && per < per_lt)) continue;
+              if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
+              if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
+            } catch (e) {
+              // 財務で落ちた銘柄はスキップ（全体は落とさない）
+              continue;
+            }
+          }
+
+          const liqScore = Math.log10(Math.max(1, avg_trading_value));
+          const momScore = (mom_3m == null ? 0 : mom_3m * 100);
+          const score = Math.round(10 * (liqScore + momScore));
+
+          items.push({
+            code,
+            name: meta.name,
+            per, pbr, dividend_yield,
+            mom_3m, mom_6m, mom_12m,
+            avg_trading_value: Math.round(avg_trading_value),
+            score
+          });
+          kept++;
+          if (items.length >= limit) break; // 目的件数が揃ったら終了
+        }
+
+        items.sort((a, b) => b.score - a.score);
+        const payload = { count: Math.min(items.length, limit), items: items.slice(0, limit) };
+        if (debug) payload._debug = Object.assign(DBG, {
+          processed, kept, scanned, ms: Date.now() - t0, budget_ms: budgetMs
         });
+        return safeReturn(payload);
+      } catch (e) {
+        // ここに落ちても 200 / 空リストで返す（コネクタが {} にしないように）
+        return safeReturn({ error: String(e && e.message || e) });
       }
-
-      items.sort((a, b) => b.score - a.score);
-      return json(res, 200, { count: Math.min(items.length, limit), items: items.slice(0, limit) });
     }
 
     // /api/portfolio/summary（codes の explode/非explode 両対応）
