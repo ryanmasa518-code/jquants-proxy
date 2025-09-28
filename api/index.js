@@ -242,14 +242,23 @@ async function fetchDailyQuotesByDate(dateStr, idTokenOverride) {
   return arr.map(mapDailyQuote);
 }
 
-// 直近N営業日の平均売買代金（TurnoverValue）＋最新終値
-async function buildLiquidityAndClose(days = 20, idTokenOverride) {
+// 流動性（売買代金）の算出：
+// mode="avg": 直近N営業日の平均（重い）
+// mode="latest": 直近1日で近似（軽い・推奨）
+async function buildLiquidityAndClose(days = 20, idTokenOverride, mode = "latest") {
+  if (mode === "latest") {
+    const dates = await getRecentTradingDates(1, idTokenOverride);
+    if (dates.length === 0) return { avgTV: new Map(), latestClose: new Map() };
+    const items = await fetchDailyQuotesByDate(dates[0], idTokenOverride);
+    const latestClose = new Map(items.map(it => [codeStr(it.code), it.close]));
+    const avgTV = new Map(items.map(it => [codeStr(it.code), Number(it.turnover) || 0]));
+    return { avgTV, latestClose };
+  }
+  // 旧来: 平均モード（重いが精度高）
   const dates = await getRecentTradingDates(days, idTokenOverride);
   if (dates.length === 0) return { avgTV: new Map(), latestClose: new Map() };
-
   const sumTV = new Map();
   let lastDayClose = new Map();
-
   for (let i = 0; i < dates.length; i++) {
     const dt = dates[i];
     const items = await fetchDailyQuotesByDate(dt, idTokenOverride);
@@ -614,11 +623,12 @@ export default async function handler(req, res) {
       const minAvg = toInt(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
       const days = toInt(url.searchParams.get("days"));
       const fast = toInt(url.searchParams.get("fast")) === 1;
+      const liqMode = (url.searchParams.get("liquidity_mode") || (fast ? "latest" : "latest")).toLowerCase(); // 既定=latest
       const daysEff = (days != null ? days : (fast ? 5 : 20));
 
       const [listedMap, liq] = await Promise.all([
         getListedMap(idTokenOverride),
-        buildLiquidityAndClose(daysEff, idTokenOverride)
+        buildLiquidityAndClose(daysEff, idTokenOverride, liqMode)
       ]);
 
       const out = [];
@@ -641,16 +651,29 @@ export default async function handler(req, res) {
       const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
       const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
       const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
-      const fast = toInt(url.searchParams.get("fast")) === 1;
+      const liqMode = (url.searchParams.get("liquidity_mode") || (fast ? "latest" : "latest")).toLowerCase(); // 既定=latest
 
       const [listedMap, { avgTV, latestClose }, momSnaps] = await Promise.all([
         getListedMap(idTokenOverride),
-        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride),
+        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride, liqMode),
         (fast ? Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() }) : buildMomentumSnapshots(idTokenOverride)),
       ]);
 
+      // 任意の対象銘柄リスト（カンマ区切り or codes=複数）
+      const uniParam = url.searchParams.get("universe");
+      const uniMulti = url.searchParams.getAll("universe");
+      let allowSet = null;
+      if (uniParam || (uniMulti && uniMulti.length > 1)) {
+        const raw = [
+          ...(uniParam ? uniParam.split(",") : []),
+          ...((uniMulti.length > 1) ? uniMulti : [])
+        ].map(s => codeStr(String(s).trim())).filter(Boolean);
+        allowSet = new Set(raw);
+      }
+
       const items = [];
       for (const [code, avg_trading_value] of avgTV.entries()) {
+        if (allowSet && !allowSet.has(code)) continue;
         const meta = listedMap.get(code) || { name: "", marketJa: "" };
         if (!marketMatch(market, meta.marketJa)) continue;
         if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
