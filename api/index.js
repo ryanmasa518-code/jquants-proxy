@@ -25,7 +25,18 @@ function toNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
 }
-function codeStr(x) { return String(x || "").padStart(4, "0"); }
+// J-Quantsの日足は 5桁 (例: 67580)。銘柄の“本体コード”は先頭4桁なので統一する。
+function codeStr(x) {
+  const s = String(x || "").trim();
+  // 先頭4桁が数字ならそれを採用（5桁の末尾セクター桁を落とす）
+  const m = s.match(/^(\d{4})\d$/);
+  if (m) return m[1];
+  // 5桁以上だが先頭4桁が数字なら先頭4桁
+  const n = s.match(/^(\d{4})/);
+  if (n) return n[1];
+  // それ以外はゼロ埋め4桁
+  return s.padStart(4, "0");
+}
 function normDateStr(s) { return typeof s === "string" ? s : String(s || ""); }
 
 // -------------------- 認証（refreshToken / idToken キャッシュ）
@@ -151,7 +162,7 @@ async function jqGETAll(path, idTokenOverride) {
 function mapDailyQuote(rec) {
   return {
     date: normDateStr(pick(rec, "Date", "date")),
-    code: String(pick(rec, "Code", "code") || ""),
+    code: codeStr(pick(rec, "Code", "code") || ""),
     close: toNum(pick(rec, "Close", "EndPrice", "close", "endPrice", "AdjustedClose", "adjusted_close")),
     turnover: toNum(pick(rec, "TurnoverValue", "turnoverValue", "trading_value"))
   };
@@ -163,7 +174,7 @@ function mapWeeklyMargin(rec) {
   const selling = Number.isFinite(sell) ? sell : 0;
   return {
     date: normDateStr(pick(rec, "Date", "date")),
-    code: String(pick(rec, "Code", "code") || ""),
+    code: codeStr(pick(rec, "Code", "code") || ""),
     buying, selling,
     net: (Number.isFinite(buying) && Number.isFinite(selling)) ? (buying - selling) : null,
     ratio: buying ? (selling / buying) : null
@@ -175,7 +186,7 @@ function mapDailyPublic(rec) {
   const r = toNum(pick(rec, "ShortLongRatio", "short_long_ratio", "MarginRate", "margin_rate"));
   return {
     date: normDateStr(pick(rec, "PublishedDate", "Date", "date")),
-    code: String(pick(rec, "Code", "code") || ""),
+    code: codeStr(pick(rec, "Code", "code") || ""),
     buying: Number.isFinite(buy) ? buy : 0,
     selling: Number.isFinite(sell) ? sell : 0,
     net: (Number.isFinite(buy) && Number.isFinite(sell)) ? (buy - sell) : null,
@@ -189,8 +200,9 @@ async function getListedMap(idTokenOverride) {
   const info = j.info || [];
   const m = new Map();
   for (const it of info) {
-    m.set(codeStr(pick(it, "Code", "code")), {
-      code: codeStr(pick(it, "Code", "code")),
+    const c = codeStr(pick(it, "Code", "code"));
+    m.set(c, {
+      code: c,
       name: String(pick(it, "CompanyName", "name") || ""),
       marketJa: String(pick(it, "MarketCodeName", "Market", "market") || "")
     });
