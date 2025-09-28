@@ -1,7 +1,7 @@
 // api/index.js
 // J-Quants JP Proxy (Screening) — full replacement
 // 必須Env: PROXY_BEARER
-// どちらか: (A) JQ_REFRESH_TOKEN  または  (B) JQ_MAIL + JQ_PASSWORD
+// どちらか: (A) JQ_REFRESH_TOKEN  または  (B) JQ_EMAIL + JQ_PASSWORD
 // 任意Env: LOG_LEVEL=debug で簡易デバッグログ
 //
 // 実装の要点:
@@ -60,9 +60,9 @@ function requireProxyAuth(req, res) {
 
 // refreshToken をメール/パスワードから取得（週1回想定）
 async function fetchRefreshTokenFromUserPass() {
-  const mail = process.env.JQ_MAIL;
+  const mail = process.env.JQ_EMAIL;
   const pass = process.env.JQ_PASSWORD;
-  if (!mail || !pass) throw new Error("Missing JQ_MAIL / JQ_PASSWORD");
+  if (!mail || !pass) throw new Error("Missing JQ_EMAIL / JQ_PASSWORD");
 
   const r = await fetch(`${JQ_BASE}/token/auth_user`, {
     method: "POST",
