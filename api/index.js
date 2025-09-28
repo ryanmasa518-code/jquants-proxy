@@ -668,11 +668,8 @@ export default async function handler(req, res) {
       return json(res, 200, { count: out.length, items: out });
     }
 
-    // /api/screen/basic（fast=1 でモメンタム計算を省略 → 安定動作確認用）
+    // /api/screen/basic（fast=1 で軽量。mom3m_gt を指定したらモメンタムだけ有効化）
     if (path === "/api/screen/basic" && method === "GET") {
-      const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
-      const sleepMs  = toInt(url.searchParams.get("sleep_ms"))  ?? undefined;
-      const jqAllOpt = { maxPages, sleepMs };
       const market = url.searchParams.get("market") || "All";
       const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
       const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
@@ -680,15 +677,18 @@ export default async function handler(req, res) {
       const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
       const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
       const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
-      const liqMode = (url.searchParams.get("liquidity_mode") || (fast ? "latest" : "latest")).toLowerCase(); // 既定=latest
 
-      const [listedMap, { avgTV, latestClose }, momSnaps] = await Promise.all([
-        getListedMap(idTokenOverride),
-        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride, liqMode),
-        (fast ? Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() }) : buildMomentumSnapshots(idTokenOverride)),
-      ]);
+      // ★ここが重要：fast を必ず定義（未指定なら false）
+      const fastParam = (url.searchParams.get("fast") || "").toLowerCase();
+      const fast = (fastParam === "1" || fastParam === "true");
 
-      // 任意の対象銘柄リスト（カンマ区切り or codes=複数）
+      // 流動性の算出モード（既定: latest=直近1日で近似）
+      const liqMode = (url.searchParams.get("liquidity_mode") || "latest").toLowerCase();
+
+      // mom3m_gt を使うならモメンタムが必要。fast 指定でもモメンタムだけは計算する
+      const needMomentum = (mom3m_gt != null) ? true : !fast;
+
+      // 任意の対象銘柄リスト（universe=カンマ区切り or 複数指定）
       const uniParam = url.searchParams.get("universe");
       const uniMulti = url.searchParams.getAll("universe");
       let allowSet = null;
@@ -700,24 +700,39 @@ export default async function handler(req, res) {
         allowSet = new Set(raw);
       }
 
+      // ページング制御（あれば引き回し）
+      const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
+      const sleepMs  = toInt(url.searchParams.get("sleep_ms"))  ?? undefined;
+      const jqAllOpt = { maxPages, sleepMs };
+
+      const [listedMap, liq, momSnaps] = await Promise.all([
+        getListedMap(idTokenOverride),
+        // fast のときは days=5・latest 近似が軽い。avg にしたい時はクエリで上書き可
+        buildLiquidityAndClose(fast ? 5 : 20, idTokenOverride, liqMode),
+        (needMomentum ? buildMomentumSnapshots(idTokenOverride) : Promise.resolve({ d0:new Map(), d3:new Map(), d6:new Map(), d12:new Map() })),
+      ]);
+
       const items = [];
-      for (const [code, avg_trading_value] of avgTV.entries()) {
+      for (const [code, avg_trading_value] of liq.avgTV.entries()) {
         if (allowSet && !allowSet.has(code)) continue;
+
         const meta = listedMap.get(code) || { name: "", marketJa: "" };
         if (!marketMatch(market, meta.marketJa)) continue;
         if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
 
-        const mom_3m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code)));
-        const mom_6m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code)));
-        const mom_12m = (fast ? null : calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code)));
+        // モメンタム（必要なときだけ計算）
+        const mom_3m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code)) : null;
+        const mom_6m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code)) : null;
+        const mom_12m = needMomentum ? calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code)) : null;
         if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
 
+        // バリュー系（必要な場合だけ取りに行く）
         let per = null, pbr = null, dividend_yield = null;
         if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
           try {
             const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
             const s = summarizeFins(stmts);
-            const close = latestClose.get(code);
+            const close = liq.latestClose.get(code);
             if (Number.isFinite(close)) {
               if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
               if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
@@ -727,7 +742,7 @@ export default async function handler(req, res) {
             if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
             if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
           } catch (e) {
-            dlog("fins fetch failed for", code, e.message);
+            // 財務が取れない銘柄はスキップ（落とさない）
             continue;
           }
         }
