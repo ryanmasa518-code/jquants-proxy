@@ -292,20 +292,98 @@ function calcReturn(nowClose, pastClose) {
 }
 
 // statements（EPS/BPS/DPS の簡易要約）
-function pickNumAny(obj, keys) {
-  for (const k of keys) {
-    const v = obj && obj[k];
-    if (v === "-" || v === "*" || v === "" || v == null) continue;
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
+// ---- 強化版：財務の値取得（キー揺れ対応 + あいまい一致） ----
+function numFrom(obj, options) {
+  // options: { aliases?: string[], regexKeys?: RegExp[], coerce?: (n)=>number|null }
+  if (!obj || typeof obj !== "object") return null;
+  const { aliases = [], regexKeys = [], coerce } = options || {};
+
+  // 1) 厳密キー（大文字小文字＆スネーク/キャメル差吸収）
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normMap = new Map();
+  for (const k of Object.keys(obj)) normMap.set(norm(k), k);
+
+  for (const a of aliases) {
+    const k = normMap.get(norm(a));
+    if (k != null) {
+      const v = obj[k];
+      if (v !== "" && v !== "-" && v !== "*" && v != null && Number.isFinite(Number(v))) {
+        const n = Number(v);
+        return coerce ? coerce(n) : n;
+      }
+    }
+  }
+
+  // 2) 正規表現でキー名を走査（例：/book.*value.*per.*share/i）
+  if (regexKeys.length) {
+    for (const k of Object.keys(obj)) {
+      for (const re of regexKeys) {
+        if (re.test(k)) {
+          const v = obj[k];
+          if (v !== "" && v !== "-" && v !== "*" && v != null && Number.isFinite(Number(v))) {
+            const n = Number(v);
+            return coerce ? coerce(n) : n;
+          }
+        }
+      }
+    }
   }
   return null;
 }
 
+// BPS を Equity / Shares から算出（スケール異常に軽い補正ロジック付き）
+function deriveBpsFromEquityShares(latest) {
+  if (!latest) return null;
+
+  // 純資産（親会社株主帰属）候補
+  const equity = numFrom(latest, {
+    aliases: [
+      "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
+    ],
+    regexKeys: [
+      /^(equity|net.?assets|total.?equity|equity.?attributable.*parent)$/i
+    ]
+  });
+
+  // 期末発行株式数（自己株含む/含まない等いろいろ）
+  let shares = numFrom(latest, {
+    aliases: [
+      "NumberOfIssuedAndOutstandingSharesAtEndOfFiscalYearIncludingTreasuryStock",
+      "NumberOfIssuedAndOutstandingSharesAtEndOfFiscalYear",
+      "IssuedShares",
+      "CommonSharesOutstanding",
+      "NumberOfShares"
+    ],
+    regexKeys: [
+      /issued.*outstanding.*shares.*(fiscal|year|end)?/i,
+      /common.*shares.*outstanding/i,
+      /number.*of.*shares/i
+    ]
+  });
+
+  if (equity == null || shares == null || shares <= 0) return null;
+
+  // 一部データは「千株/百万株」単位のことがあるので、雑にスケール補正を試みる
+  // 目安：日本の大型株で shares が 1e12 を超えることは稀 → 1e6, 1e3 で割るケースをチェック
+  const tryScales = [1, 1e3, 1e6];
+  let best = null;
+  for (const s of tryScales) {
+    const perShare = equity / (shares * s);
+    if (Number.isFinite(perShare) && perShare > 0 && perShare < 1e7) {
+      // ざっくり「1株純資産が1円〜1,000万円」の間を常識値として採用
+      best = perShare;
+      break;
+    }
+  }
+  return best;
+}
+
+// ---- 置き換え版 summarizeFins（EPS/BPS/DPS/ROE/ROA を最大限埋める） ----
 function summarizeFins(statements) {
   if (!Array.isArray(statements) || statements.length === 0) {
     return { eps_ttm: null, bps: null, dps: null, roe: null, roa: null };
   }
+
   // 開示日降順
   const items = [...statements].sort((a, b) => {
     const da = String(a.DisclosedDate || a.disclosedDate || "");
@@ -313,78 +391,84 @@ function summarizeFins(statements) {
     return db.localeCompare(da);
   });
 
-  // ---- EPS (TTM) ----
+  const latest = items[0] || {};
+  const prev   = items[1] || {};
+
+  // EPS (TTM) … 直近4期合算
   const epsVals = [];
-  for (const it of items) {
-    const e = pickNumAny(it, ["EarningsPerShare", "EPS", "eps"]);
+  for (let i = 0; i < Math.min(4, items.length); i++) {
+    const e = numFrom(items[i], {
+      aliases: ["EarningsPerShare", "EPS", "eps"],
+      regexKeys: [/^eps$/i, /earnings.*per.*share/i]
+    });
     if (e != null) epsVals.push(e);
-    if (epsVals.length >= 4) break;
   }
   const eps_ttm = epsVals.length ? epsVals.reduce((a, b) => a + b, 0) : null;
 
-  // ---- BPS ----
-  // 1) per-share の直接項目を優先
-  let bps = pickNumAny(items[0] || {}, ["BookValuePerShare", "NetAssetsPerShare", "BPS", "bps"]);
-  // 2) 無ければ Equity / Shares で算出（直近期）
-  if (bps == null) {
-    const latest = items[0] || {};
-    const equity = pickNumAny(latest, [
-      "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
-    ]);
-    const shares = pickNumAny(latest, [
-      "NumberOfIssuedAndOutstandingSharesAtEndOfFiscalYearIncludingTreasuryStock",
-      "IssuedShares", "CommonSharesOutstanding", "NumberOfShares"
-    ]);
-    if (equity != null && shares != null && shares > 0) bps = equity / shares;
-  }
+  // BPS … 1) 直接 per-share 値 → 2) Equity/Shares から算出
+  let bps =
+    numFrom(latest, {
+      aliases: ["BookValuePerShare", "NetAssetsPerShare", "BPS", "bps", "EquityPerShare"],
+      regexKeys: [/book.*value.*per.*share/i, /net.*assets.*per.*share/i, /\bbps\b/i, /equity.*per.*share/i]
+    });
+  if (bps == null) bps = deriveBpsFromEquityShares(latest);
 
-  // ---- DPS ----
-  // 優先度: 実績 > 予想。無ければ四半期の CashDividendsPaidPerShare 合算
-  let dps = pickNumAny(items[0] || {}, [
-    "ResultDividendPerShareAnnual",
-    "ForecastDividendPerShareAnnual",
-    "DividendPerShare",
-    "DPS", "dps"
-  ]);
+  // DPS … 実績 > 予想。無ければ四半期の CashDividendsPaidPerShare を合算（年換算の代替）
+  let dps = numFrom(latest, {
+    aliases: [
+      "ResultDividendPerShareAnnual",
+      "ForecastDividendPerShareAnnual",
+      "DividendPerShare", "DPS", "dps"
+    ],
+    regexKeys: [/dividend.*per.*share/i]
+  });
   if (dps == null) {
-    let tmp = 0, cnt = 0;
+    let sum = 0, seen = 0;
     for (let i = 0; i < Math.min(4, items.length); i++) {
-      const v = pickNumAny(items[i], ["CashDividendsPaidPerShare"]);
-      if (v != null) { tmp += v; cnt++; }
+      const q = numFrom(items[i], { aliases: ["CashDividendsPaidPerShare"], regexKeys: [/cash.*dividends.*per.*share/i] });
+      if (q != null) { sum += q; seen++; }
     }
-    if (cnt > 0) dps = tmp;
+    if (seen > 0) dps = sum;
   }
 
-  // ---- ROE / ROA（近似：TTM利益 / (期首・期末の平均残高)）----
-  let roe = null, roa = null;
-  const eq_end = pickNumAny(items[0] || {}, [
-    "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
-  ]);
-  const ta_end = pickNumAny(items[0] || {}, ["TotalAssets"]);
-  const eq_begin = pickNumAny(items[1] || {}, [
-    "Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"
-  ]);
-  const ta_begin = pickNumAny(items[1] || {}, ["TotalAssets"]);
-
-  // 親会社株主帰属利益（TTM）
+  // ROE/ROA … 近似：TTM純利益 / ((期末 + 1期前末)/2)
+  // TTM親会社株主利益
   let ni_ttm = null;
-  let sumNI = 0, seen = 0;
+  let sumNI = 0, cnt = 0;
   for (let i = 0; i < Math.min(4, items.length); i++) {
-    const ni = pickNumAny(items[i], [
-      "ProfitLossAttributableToOwnersOfParent",
-      "NetIncome", "NetIncomeAttributableToOwnersOfParent"
-    ]);
-    if (ni != null) { sumNI += ni; seen++; }
+    const ni = numFrom(items[i], {
+      aliases: [
+        "ProfitLossAttributableToOwnersOfParent",
+        "NetIncome", "NetIncomeAttributableToOwnersOfParent"
+      ],
+      regexKeys: [/profit.*owners.*parent/i, /net.*income/i]
+    });
+    if (ni != null) { sumNI += ni; cnt++; }
   }
-  if (seen > 0) ni_ttm = sumNI;
+  if (cnt > 0) ni_ttm = sumNI;
+
+  const eq_end = numFrom(latest, {
+    aliases: ["Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"],
+    regexKeys: [/^equity$/i, /net.?assets/i, /total.?equity/i, /equity.?attributable.*parent/i]
+  });
+  const eq_begin = numFrom(prev, {
+    aliases: ["Equity", "NetAssets", "TotalEquity", "EquityAttributableToOwnersOfParent"],
+    regexKeys: [/^equity$/i, /net.?assets/i, /total.?equity/i, /equity.?attributable.*parent/i]
+  });
+
+  const ta_end = numFrom(latest, { aliases: ["TotalAssets"], regexKeys: [/total.*assets/i] });
+  const ta_begin = numFrom(prev,   { aliases: ["TotalAssets"], regexKeys: [/total.*assets/i] });
 
   const eq_avg = (eq_end != null && eq_begin != null) ? (eq_end + eq_begin) / 2 : null;
   const ta_avg = (ta_end != null && ta_begin != null) ? (ta_end + ta_begin) / 2 : null;
+
+  let roe = null, roa = null;
   if (ni_ttm != null && eq_avg && eq_avg !== 0) roe = ni_ttm / eq_avg;
   if (ni_ttm != null && ta_avg && ta_avg !== 0) roa = ni_ttm / ta_avg;
 
   return { eps_ttm, bps, dps, roe, roa };
 }
+
 async function fetchFinsStatementsByCode(code, idTokenOverride) {
   const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`, idTokenOverride);
   return j.statements || [];
