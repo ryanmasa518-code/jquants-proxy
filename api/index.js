@@ -1,664 +1,630 @@
-// api/index.js — J-Quants proxy (PROD-hardened + credit + portfolio)
-// 認証: Authorization: Bearer のみ（?key / X-Proxy-Key は無効）
-// TTL: /listed=24h, /prices=10m, /fins=3d, /credit/weekly=24h, /credit/daily_public=6h, /portfolio/summary=3h
-// 率制御: withLimit(MAX_CONCURRENCY=5) + リトライ(MAX_RETRIES=3, 基本待ち=400ms, 2倍指数)
-// キー管理: auth_refresh失敗時は JQ_EMAIL/PASSWORD でrefreshToken再取得（ENV設定前提）
+// api/index.js
+// J-Quants Proxy (Screening) - full replacement
+// Vercel Node.js (Edge ではなく Node.js) 用。必要に応じて runtime 設定は vercel.json/next.config.js 側で。
+// Env 必須:
+//   - PROXY_BEARER:     プロキシ利用時のベアラートークン（クライアント→このプロキシ）
+//   - JQ_REFRESH_TOKEN: J-Quants の refreshToken（/token/auth_user かメニューから取得）
+// 任意:
+//   - LOG_LEVEL: debug にすると各種ログが少し出ます
 
 const JQ_BASE = "https://api.jquants.com/v1";
+const VERSION = "1.0.8-fix-keys";
 
-const {
-  JQ_REFRESH_TOKEN: RAW_RT,
-  JQ_EMAIL,
-  JQ_PASSWORD,
-  PROXY_BEARER,
-  MAX_CONCURRENCY = "5",
-  MAX_RETRIES = "3",
-  BASE_BACKOFF_MS = "400",
-} = process.env;
+const isDebug = () => (process.env.LOG_LEVEL || "").toLowerCase() === "debug";
+const dlog = (...args) => { if (isDebug()) console.log("[DEBUG]", ...args); };
 
-const ENV_REFRESH_TOKEN = (RAW_RT || "").trim();
-const LIMIT = Math.max(1, Number(MAX_CONCURRENCY));
-const RETRIES = Math.max(0, Number(MAX_RETRIES));
-const BACKOFF0 = Math.max(50, Number(BASE_BACKOFF_MS));
+// ==============================
+// 内部トークンキャッシュ
+// ==============================
+let ID_TOKEN = null;
+let ID_TOKEN_EXP_AT = 0; // epoch ms
 
-// ===== state/cache =====
-let cache = {
-  idToken: null,
-  idTokenExpAt: 0,
-  refreshToken: ENV_REFRESH_TOKEN || null,
-  resp: new Map(), // key -> {expAt,json}
-};
+function json(res, code, obj) {
+  res.status(code).json(obj);
+}
 
-// ===== utils =====
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const nowIso = () => new Date().toISOString();
-function safeJson(res, status, body) {
-  try {
-    res.statusCode = status;
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify(body));
-  } catch {
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.end("Internal Server Error");
+function now() {
+  return Date.now();
+}
+
+function msUntilExp() {
+  return Math.max(0, (ID_TOKEN_EXP_AT || 0) - now());
+}
+
+function requireProxyAuth(req, res) {
+  const header = req.headers["authorization"] || req.headers["Authorization"];
+  if (!header || !header.startsWith("Bearer ")) {
+    json(res, 401, { error: "Missing Authorization: Bearer" });
+    return false;
   }
-}
-function safeParseURL(req) {
-  try {
-    const raw = typeof req?.url === "string" ? req.url : "/";
-    return new URL(raw, "http://localhost");
-  } catch {
-    return new URL("http://localhost/");
+  const token = header.slice("Bearer ".length).trim();
+  if (!process.env.PROXY_BEARER || token !== process.env.PROXY_BEARER) {
+    json(res, 401, { error: "Invalid bearer token" });
+    return false;
   }
-}
-function num(v){ const n=Number(v); return Number.isFinite(n)?n:0; }
-function pick(o, ks){ for(const k of ks) if(o && o[k]!=null) return o[k]; }
-
-// 認可: Bearer のみ
-function requireProxyBearer(req) {
-  if (!PROXY_BEARER) return true; // env未設定時はスキップ（必要ならfalseに）
-  const h = (req.headers?.["authorization"] || "").toString();
-  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-  return !!token && token === PROXY_BEARER;
+  return true;
 }
 
-// ===== logging =====
-function logInfo(evt, extra={}) { console.log(JSON.stringify({lvl:"info", ts:nowIso(), evt, ...extra})); }
-function logWarn(evt, extra={}) { console.warn(JSON.stringify({lvl:"warn", ts:nowIso(), evt, ...extra})); }
-function logError(evt, extra={}){ console.error(JSON.stringify({lvl:"error",ts:nowIso(), evt, ...extra})); }
+async function refreshIdToken(maybeRefreshToken) {
+  const refreshToken = maybeRefreshToken || process.env.JQ_REFRESH_TOKEN;
+  if (!refreshToken) throw new Error("JQ_REFRESH_TOKEN is not set");
 
-// ===== concurrency limiter =====
-let active = 0;
-const waiters = [];
-async function withLimit(fn) {
-  if (active >= LIMIT) await new Promise(r => waiters.push(r));
-  active++;
-  try { return await fn(); }
-  finally {
-    active--;
-    const n = waiters.shift();
-    if (n) n();
+  const url = `${JQ_BASE}/token/auth_refresh?refreshtoken=${encodeURIComponent(refreshToken)}`;
+  const r = await fetch(url, { method: "POST" });
+  const t = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    throw new Error(`auth_refresh failed: ${r.status} ${JSON.stringify(t)}`);
   }
+
+  const idToken = t.idToken;
+  if (!idToken) throw new Error("auth_refresh success but idToken missing");
+
+  // JQのIDトークンは有効期間24h。安全側に -5分 の猶予。
+  ID_TOKEN = idToken;
+  ID_TOKEN_EXP_AT = now() + 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
+
+  return { idToken: ID_TOKEN, expAt: ID_TOKEN_EXP_AT };
 }
 
-// ===== JQ fetch with retry/backoff =====
-async function jqFetchRaw(url, headers) { return fetch(url, { headers }); }
-
-async function jqFetch(path, params = {}, idToken) {
-  const url = new URL(JQ_BASE + path);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
-  }
-  const headers = idToken ? { Authorization: `Bearer ${idToken}` } : {};
-  const urlStr = url.toString();
-
-  return withLimit(async () => {
-    let attempt = 0, lastErrTxt = "";
-    const t0 = Date.now();
-    while (true) {
-      try {
-        const res = await jqFetchRaw(urlStr, headers);
-        if (res.status === 429 && attempt < RETRIES) {
-          const backoff = BACKOFF0 * Math.pow(2, attempt);
-          logWarn("jq.rate_limited", { path, attempt, backoff_ms: backoff });
-          await sleep(backoff); attempt++; continue;
-        }
-        if (!res.ok) {
-          const txt = await res.text().catch(()=> ""); lastErrTxt = txt;
-          if (res.status >= 500 && attempt < RETRIES) {
-            const backoff = BACKOFF0 * Math.pow(2, attempt);
-            logWarn("jq.server_error_retry", { path, status: res.status, attempt, backoff_ms: backoff, body: txt.slice(0,500) });
-            await sleep(backoff); attempt++; continue;
-          }
-          logError("jq.error", { path, status: res.status, body: txt.slice(0,1000) });
-          throw new Error(`JQ ${res.status}: ${txt || res.statusText}`);
-        }
-        const json = await res.json();
-        const dt = Date.now() - t0;
-        if (attempt>0) logInfo("jq.success_after_retry", { path, attempts: attempt+1, ms: dt });
-        return json;
-      } catch (e) {
-        if (attempt < RETRIES) {
-          const backoff = BACKOFF0 * Math.pow(2, attempt);
-          logWarn("jq.fetch_retry", { path, attempt, backoff_ms: backoff, err: String(e).slice(0,300) });
-          await sleep(backoff); attempt++; continue;
-        }
-        const dt = Date.now() - t0;
-        logError("jq.fetch_fail", { path, attempts: attempt+1, ms: dt, lastErrTxt: lastErrTxt.slice(0,500) });
-        throw e;
-      }
-    }
-  });
-}
-
-// ===== auth =====
-async function getRefreshTokenByPassword() {
-  if (!JQ_EMAIL || !JQ_PASSWORD) throw new Error("Missing JQ_EMAIL/JQ_PASSWORD for refresh-token bootstrap.");
-  const res = await fetch(`${JQ_BASE}/token/auth_user`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mailaddress: JQ_EMAIL, password: JQ_PASSWORD }),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(()=> "");
-    logError("auth_user.fail", { status: res.status, body: txt.slice(0,1000) });
-    throw new Error(`auth_user failed: ${res.status} ${txt}`);
-  }
-  const data = await res.json();
-  if (!data.refreshToken) throw new Error("auth_user returned no refreshToken");
-  logInfo("auth_user.ok");
-  return String(data.refreshToken).trim();
-}
-async function getIdTokenByRefresh(refreshToken) {
-  const qs = new URLSearchParams({ refreshtoken: refreshToken });
-  const url = `${JQ_BASE}/token/auth_refresh?${qs.toString()}`;
-  const res = await fetch(url, { method: "POST" });
-  if (!res.ok) {
-    const txt = await res.text().catch(()=> "");
-    logWarn("auth_refresh.fail", { status: res.status, body: txt.slice(0,1000) });
-    throw new Error(`auth_refresh failed: ${res.status} ${txt}`);
-  }
-  const data = await res.json();
-  if (!data.idToken) throw new Error("auth_refresh returned no idToken");
-  logInfo("auth_refresh.ok");
-  return data.idToken;
-}
 async function ensureIdToken() {
-  const now = Date.now();
-  if (cache.idToken && cache.idTokenExpAt - now > 60_000) return cache.idToken;
-  try {
-    if (!cache.refreshToken) cache.refreshToken = ENV_REFRESH_TOKEN || (await getRefreshTokenByPassword());
-    const idToken = await getIdTokenByRefresh(cache.refreshToken);
-    cache.idToken = idToken; cache.idTokenExpAt = now + 24*60*60_000;
-    return idToken;
-  } catch (e) {
-    if (JQ_EMAIL && JQ_PASSWORD) {
-      logWarn("ensureIdToken.fallback_refreshToken_regen", { err: String(e).slice(0,300) });
-      cache.refreshToken = await getRefreshTokenByPassword();
-      const idToken = await getIdTokenByRefresh(cache.refreshToken);
-      cache.idToken = idToken; cache.idTokenExpAt = Date.now() + 24*60*60_000;
-      return idToken;
-    }
-    throw e;
+  if (ID_TOKEN && msUntilExp() > 0) return ID_TOKEN;
+  const { idToken } = await refreshIdToken();
+  return idToken;
+}
+
+async function jqGET(pathWithQuery) {
+  const idToken = await ensureIdToken();
+  const url = `${JQ_BASE}${pathWithQuery}`;
+  dlog("GET", url);
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = body && (body.message || body.error) ? ` ${JSON.stringify(body)}` : "";
+    throw new Error(`JQ GET failed: ${r.status}${msg}`);
   }
+  return body;
 }
 
-// ===== cache helpers =====
-function getCached(key){ const hit=cache.resp.get(key); return hit && hit.expAt>Date.now()? hit.json : null; }
-function setCached(key,jsonObj,ttlMs){ cache.resp.set(key,{expAt:Date.now()+ttlMs,json:jsonObj}); }
-
-// ===== handlers =====
-async function handleHealth(_req,res){
-  safeJson(res,200,{ ok:true, ts:nowIso(), idToken_valid_ms:Math.max(0, cache.idTokenExpAt-Date.now()), concurrency:{limit:LIMIT, active} });
+function parseIntSafe(x) {
+  const n = typeof x === "string" ? parseInt(x, 10) : Number(x);
+  return Number.isFinite(n) ? n : null;
 }
-async function handleAuthRefresh(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try { const idToken = await ensureIdToken(); safeJson(res,200,{ idToken, expAt: cache.idTokenExpAt }); }
-  catch(e){ safeJson(res,500,{ error:String(e.message||e) }); }
+function parseFloatSafe(x) {
+  if (x === "-" || x === "*" || x === "" || x == null) return null;
+  const n = typeof x === "string" ? parseFloat(x) : Number(x);
+  return Number.isFinite(n) ? n : null;
 }
-// 置き換え：/api/universe/listed を軽量＆ページング対応に
-async function handleUniverseListed(req, res) {
-  const q = getQuery(req);
-  const market = (q.get('market') || 'All').trim();     // All/Prime/Standard/Growth（日本語可）
-  const limit  = Math.max(1, Math.min(500, Number(q.get('limit') || 200))); // デフォ200・最大500
-  const offset = Math.max(0, Number(q.get('offset') || 0));
-  const fieldsCsv = (q.get('fields') || 'code,name,market').trim();         // デフォ最小3項目
-  const fields = new Set(fieldsCsv.split(',').map(s => s.trim()).filter(Boolean));
-  const codesOnly = (q.get('codes_only') || '0') === '1';                   // 1 なら codes配列だけ返す
-  const search = (q.get('q') || '').trim().toLowerCase();                   // 名前/コード部分一致
 
-  // クエリ込みキャッシュキー（既存関数）
-  const key = cacheKeyFromReq(req);
-  const hit = getCache(key);
-  if (hit) return safeJson(res, 200, hit);
-
-  // 元データ取得
-  const univ = await jqGet('/v1/listed/info');
-  let list = Array.isArray(univ.info) ? univ.info : [];
-
-  // 市場フィルタ（表記ゆれ吸収）
-  if (market !== 'All') {
-    list = list.filter(x => matchMarket(x.market || x.Market, market));
+function pick(v, ...keys) {
+  for (const k of keys) {
+    if (v != null && Object.prototype.hasOwnProperty.call(v, k) && v[k] != null) return v[k];
   }
-
-  // フリーワード（コード or 名称）
-  if (search) {
-    list = list.filter(x => {
-      const code = String(x.Code || x.code || '').toLowerCase();
-      const name = String(x.Name || x.name || '').toLowerCase();
-      return code.includes(search) || name.includes(search);
-    });
-  }
-
-  const total = list.length;
-  const page = list.slice(offset, offset + limit);
-
-  if (codesOnly) {
-    const codes = page.map(x => String(x.Code || x.code || '')).filter(Boolean);
-    const payload = { count: codes.length, total, offset, limit, codes };
-    setCache(key, payload, 24 * 60 * 60 * 1000); // 1日
-    return safeJson(res, 200, payload);
-  }
-
-  // 必要フィールドだけ返す（* を含めれば全部）
-  const mapped = page.map(x => {
-    const obj = {};
-    if (fields.has('*')) {
-      // そのまま返すと肥大化するので注意。*は本当に必要な時だけ指定を想定。
-      return Object.assign({}, x, {
-        code: String(x.Code || x.code || ''),
-        name: x.Name || x.name || '',
-        market: x.Market || x.market || ''
-      });
-    }
-    if (fields.has('code'))   obj.code   = String(x.Code || x.code || '');
-    if (fields.has('name'))   obj.name   = x.Name || x.name || '';
-    if (fields.has('market')) obj.market = x.Market || x.market || '';
-    // 追加で取りたい項目があれば、必要に応じてここに列挙
-    return obj;
-  });
-
-  const payload = { count: mapped.length, total, offset, limit, items: mapped };
-  setCache(key, payload, 24 * 60 * 60 * 1000); // 1日
-  safeJson(res, 200, payload);
+  return undefined;
 }
 
-async function handlePricesDaily(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try{
-    const url=safeParseURL(req);
-    const code=(url.searchParams.get("code")||"").trim();
-    if(!code) return safeJson(res,400,{error:"Missing code"});
-    const digits=(s)=>(s||"").replace(/\D/g,"");
-    let from=digits(url.searchParams.get("from"));
-    let to=digits(url.searchParams.get("to"));
-    if(!to) to=new Date().toISOString().slice(0,10).replace(/\D/g,"");
-    if(!from){ const d=new Date(); d.setDate(d.getDate()-60); from=d.toISOString().slice(0,10).replace(/\D/g,""); }
-    if(!/^\d{8}$/.test(from)||!/^\d{8}$/.test(to)) return safeJson(res,400,{error:"Invalid date format. Use YYYYMMDD."});
-    if(Number(from)>Number(to)) return safeJson(res,400,{error:"`from` must be <= `to`"});
-
-    const key=`prices:daily:${code}:${from}:${to}`; const hit=getCached(key); if(hit) return safeJson(res,200,hit);
-    const idToken=await ensureIdToken();
-    const data=await jqFetch("/prices/daily_quotes",{code,from,to},idToken);
-    setCached(key,data,10*60_000);
-    safeJson(res,200,data);
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
+function normalizeJQDateStr(s) {
+  // "2024-09-01" も "20240901" も来るので一応文字列返し
+  return typeof s === "string" ? s : String(s || "");
 }
 
-// ===== fins/statements =====
-function sortRecent(a,b){
-  const da = pick(a,["DisclosedDate","disclosedDate","date"]) || `${pick(a,["FiscalYear","fiscalYear","fy"])||""}${pick(a,["FiscalQuarter","fiscalQuarter","fq"])||""}`;
-  const db = pick(b,["DisclosedDate","disclosedDate","date"]) || `${pick(b,["FiscalYear","fiscalYear","fy"])||""}${pick(b,["FiscalQuarter","fiscalQuarter","fq"])||""}`;
-  return String(db).localeCompare(String(da));
+function mapDailyQuote(rec) {
+  // J-Quantsのケーシング（先頭大文字）に対応、下位互換キーにもフォールバック
+  const date = normalizeJQDateStr(pick(rec, "Date", "date"));
+  const code = String(pick(rec, "Code", "code") || "");
+  const close = parseFloatSafe(pick(rec, "Close", "close"));
+  const turnover = parseFloatSafe(pick(rec, "TurnoverValue", "trading_value", "turnoverValue"));
+  return { date, code, close, turnover };
 }
-function extractPerShareLatest(rows){
-  for(const r of rows){
-    const eps = pick(r,["EPS","EarningsPerShare","BasicEPS","basicEps","eps"]);
-    const bps = pick(r,["BPS","BookValuePerShare","bps"]);
-    const dps = pick(r,["DPS","DividendPerShare","dividend","dividendPerShare","dividendsPerShare"]);
-    if (eps!=null || bps!=null || dps!=null) return { eps:num(eps), bps:num(bps), dps:num(dps) };
-  }
-  return { eps:0,bps:0,dps:0 };
+
+function mapWeeklyMargin(rec) {
+  // 週次信用残
+  const date = normalizeJQDateStr(pick(rec, "Date", "date"));
+  const code = String(pick(rec, "Code", "code") || "");
+  const buying = parseFloatSafe(
+    pick(
+      rec,
+      "LongMarginTradeVolume",
+      "long_margin_trade_volume",
+      "buying" // 万一自前計算の再入力にも備える
+    )
+  ) || 0;
+  const selling = parseFloatSafe(
+    pick(
+      rec,
+      "ShortMarginTradeVolume",
+      "short_margin_trade_volume",
+      "selling"
+    )
+  ) || 0;
+  const net = Number.isFinite(buying) && Number.isFinite(selling) ? (buying - selling) : null;
+  const ratio = buying ? (selling / buying) : null; // 比率（％ではなく倍率）
+  return { date, code, buying, selling, net, ratio };
 }
-function ttmFromQuarterly(rows, fields){
-  const q = rows.filter(r => ((r.Type||r.type||"")+"").toLowerCase().includes("q"));
-  const recent4 = (q.length ? q : rows).slice(0,4);
-  const out={};
-  for(const [label,cands] of Object.entries(fields)){
-    let sum=0; for(const r of recent4){ for(const k of cands){ if(r[k]!=null){ sum += num(r[k]); break; } } }
-    out[label]=sum;
-  }
+
+function mapDailyPublic(rec) {
+  // 日々公表信用残
+  const date = normalizeJQDateStr(pick(rec, "PublishedDate", "Date", "date"));
+  const code = String(pick(rec, "Code", "code") || "");
+  const buying = parseFloatSafe(pick(rec, "LongMarginOutstanding", "long_margin_outstanding")) || 0;
+  const selling = parseFloatSafe(pick(rec, "ShortMarginOutstanding", "short_margin_outstanding")) || 0;
+  const net = Number.isFinite(buying) && Number.isFinite(selling) ? (buying - selling) : null;
+  const slrPct = parseFloatSafe(pick(rec, "ShortLongRatio", "short_long_ratio")); // 単位：％
+  const margin_rate = slrPct != null ? slrPct / 100 : null; // スキーマは ratio 相当、0-1 に正規化
+  return { date, code, buying, selling, net, margin_rate };
+}
+
+function codeStr(x) {
+  return String(x || "").padStart(4, "0");
+}
+
+// 営業日（HolidayDivision 1:営業日 / 2:半日 も含める）
+async function getRecentTradingDates(nDays) {
+  const today = new Date();
+  const to = today.toISOString().slice(0, 10);
+  const fromDate = new Date(today.getTime() - 400 * 24 * 60 * 60 * 1000);
+  const from = fromDate.toISOString().slice(0, 10);
+
+  const cal = await jqGET(`/markets/trading_calendar?from=${from}&to=${to}`);
+  const list = (cal.trading_calendar || []).map(r => ({
+    date: normalizeJQDateStr(pick(r, "Date", "date")),
+    holiday: String(pick(r, "HolidayDivision", "holidayDivision", "Holiday")) // 念のため
+  }));
+
+  const biz = list.filter(d => d.holiday === "1" || d.holiday === "2").map(d => d.date);
+  // 後ろから nDays
+  const uniq = Array.from(new Set(biz)).sort(); // 昇順
+  const out = uniq.slice(Math.max(0, uniq.length - nDays));
+  dlog("trading dates picked", out.length);
   return out;
 }
-async function fetchLatestClose(idToken, code){
-  const to = new Date(); const from = new Date(to.getTime() - 90*24*60*60_000);
-  const fmt=(d)=>d.toISOString().slice(0,10).replace(/\D/g,"");
-  const data=await jqFetch("/prices/daily_quotes",{code,from:fmt(from),to:fmt(to)},idToken);
-  const rows=Array.isArray(data)?data:(data.daily_quotes||data.data||[]);
-  const last=rows[rows.length-1]||{};
-  return num(pick(last,["Close","close","endPrice","AdjustedClose","adjusted_close"]));
-}
-async function handleFinsStatements(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try{
-    const url=safeParseURL(req);
-    const code=(url.searchParams.get("code")||"").trim();
-    if(!code) return safeJson(res,400,{error:"Missing code"});
 
-    const key=`fins:${code}`; const hit=getCached(key); if(hit) return safeJson(res,200,hit);
-
-    const idToken=await ensureIdToken();
-    const resp=await jqFetch("/fins/statements",{code},idToken);
-    const rows0=Array.isArray(resp)?resp:(resp.statements||resp.data||[]);
-    if(!rows0.length) return safeJson(res,404,{error:"No statements"});
-    const rows=[...rows0].sort(sortRecent);
-
-    const ttm = ttmFromQuarterly(rows, {
-      revenue:["NetSales","netSales","Revenue","revenue"],
-      op:["OperatingIncome","operatingIncome"],
-      ni:["NetIncome","netIncome","Profit","profit","ProfitAttributableToOwnersOfParent","netIncomeAttributableToOwnersOfParent"],
-    });
-
-    const shares = num(pick(rows[0],["SharesOutstanding","sharesOutstanding","NumberOfIssuedAndOutstandingShares","issuedShares"]));
-    const perShare = extractPerShareLatest(rows);
-    const epsTTM = (shares>0 && ttm.ni) ? (ttm.ni/shares) : perShare.eps;
-
-    const close = await fetchLatestClose(idToken, code);
-    const mc = shares>0 ? shares*close : 0;
-
-    const per = epsTTM>0 ? (close/epsTTM) : null;
-    const pbr = perShare.bps>0 ? (close/perShare.bps) : null;
-    const divYield = (perShare.dps>0 && close>0) ? (perShare.dps/close) : 0;
-
-    const equity = num(pick(rows[0],["Equity","equity","TotalEquity","totalEquity","NetAssets","netAssets"]));
-    const assets = num(pick(rows[0],["TotalAssets","totalAssets","Assets","assets"]));
-    const roe = (equity>0 && ttm.ni) ? (ttm.ni/equity) : null;
-    const roa = (assets>0 && ttm.ni) ? (ttm.ni/assets) : null;
-
-    const summary = { code, close, marketCap: mc, eps_ttm: epsTTM, bps: perShare.bps, dps: perShare.dps, per, pbr, dividend_yield: divYield, roe, roa };
-    const payload = { summary, raw_count: rows.length };
-    setCached(key, payload, 3*24*60*60_000);
-    safeJson(res,200,payload);
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
+// 最新の営業日
+async function getLatestTradingDate() {
+  const d = await getRecentTradingDates(1);
+  return d[0];
 }
 
-// ===== credit: weekly margin interest =====
-async function handleCreditWeekly(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try{
-    const url=safeParseURL(req);
-    const code=(url.searchParams.get("code")||"").trim();
-    const weeks=Math.max(4, Number(url.searchParams.get("weeks")||"26"));
-    if(!code) return safeJson(res,400,{error:"Missing code"});
-
-    const key=`credit:weekly:${code}:${weeks}`; const hit=getCached(key); if(hit) return safeJson(res,200,hit);
-
-    const idToken=await ensureIdToken();
-    const to=new Date(); const from=new Date(to.getTime()-370*24*60*60_000);
-    const fmt=(d)=>d.toISOString().slice(0,10).replace(/\D/g,"");
-    const raw=await jqFetch("/markets/weekly_margin_interest",{code,from:fmt(from),to:fmt(to)},idToken);
-
-    const rows=Array.isArray(raw)?raw:(raw.weekly_margin_interest||raw.data||[]);
-    rows.sort((a,b)=> String((b.Date||b.date||"")).localeCompare(String((a.Date||a.date||""))));
-    const take=rows.slice(0,weeks);
-
-    const n=(v)=>Number.isFinite(+v)?+v:0;
-    const items=take.map(r=>{
-      const buy=n(r.BuyingOnMargin||r.margin_buying||r.buying_on_margin);
-      const sell=n(r.SellingOnMargin||r.margin_selling||r.selling_on_margin);
-      return { date: r.Date||r.date, buying: buy, selling: sell, net: buy - sell, ratio: (buy>0? sell/buy : null) };
-    });
-
-    const cur=items[0]||{}, prev=items[1]||{};
-    const pct=(a,b)=> (b && b!==0? (a/b - 1) : null);
-    const metrics={ code, latest: cur, wow_change: { buying: pct(cur.buying,prev.buying), selling: pct(cur.selling,prev.selling), net: pct(cur.net,prev.net) } };
-
-    const payload={ code, count: items.length, metrics, items };
-    setCached(key,payload,24*60*60_000);
-    safeJson(res,200,payload);
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
-}
-
-// ===== credit: daily public margin interest =====
-async function handleCreditDailyPublic(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try{
-    const url=safeParseURL(req);
-    const code=(url.searchParams.get("code")||"").trim();
-    const days=Math.max(7, Number(url.searchParams.get("days")||"60"));
-    if(!code) return safeJson(res,400,{error:"Missing code"});
-
-    const key=`credit:daily_public:${code}:${days}`; const hit=getCached(key); if(hit) return safeJson(res,200,hit);
-
-    const idToken=await ensureIdToken();
-    const to=new Date(); const from=new Date(to.getTime()-(days+10)*24*60*60_000);
-    const fmt=(d)=>d.toISOString().slice(0,10).replace(/\D/g,"");
-    const raw=await jqFetch("/markets/daily_margin_interest",{code,from:fmt(from),to:fmt(to)},idToken);
-
-    const rows=Array.isArray(raw)?raw:(raw.daily_margin_interest||raw.data||[]);
-    rows.sort((a,b)=> String((a.Date||a.date||"")).localeCompare(String((b.Date||b.date||"")))); // 古→新
-    const take=rows.slice(-days);
-
-    const n=(v)=>Number.isFinite(+v)?+v:0;
-    const items=take.map(r=>({
-      date: r.Date||r.date,
-      buying: n(r.BuyingOnMargin||r.buying_on_margin),
-      selling: n(r.SellingOnMargin||r.selling_on_margin),
-      net: n(r.BuyingOnMargin||r.buying_on_margin) - n(r.SellingOnMargin||r.selling_on_margin),
-      margin_rate: r.MarginRate || r.margin_rate || null,
-    }));
-
-    const payload={ code, count: items.length, items };
-    setCached(key,payload,6*60*60_000);
-    safeJson(res,200,payload);
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
-}
-
-// ===== screen/liquidity (as before) =====
-async function handleScreenLiquidity(req, res) {
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try {
-    const url = safeParseURL(req);
-    const minVal   = Number(url.searchParams.get("min_avg_trading_value") || "100000000");
-    const lookback = Number(url.searchParams.get("days") || "20");
-    const market   = url.searchParams.get("market");
-
-    const idToken = await ensureIdToken();
-    const uni = await jqFetch("/listed/info", {}, idToken);
-    let list = Array.isArray(uni) ? uni : uni?.info || uni?.data || [];
-    if (market && market !== "All") {
-      const mkey = market.toLowerCase();
-      list = list.filter((x) => (x.market || x.market_code || "").toString().toLowerCase().includes(mkey));
-    }
-
-    const end = new Date(); const start = new Date(end.getTime() - 120*24*60*60_000);
-    const to = end.toISOString().slice(0,10).replace(/\D/g,"");
-    const from = start.toISOString().slice(0,10).replace(/\D/g,"");
-
-    const sample = list.slice(0, Math.min(300, list.length));
-    const out = [];
-    for (const it of sample) {
-      const code = it.code || it.Symbol || it.symbol || it.Code; if (!code) continue;
-      let daily; try { daily = await jqFetch("/prices/daily_quotes", { code, from, to }, idToken); } catch { continue; }
-      const rows = Array.isArray(daily) ? daily : daily?.daily_quotes || daily?.data || [];
-      if (!rows.length) continue;
-      const recent = rows.slice(-lookback); if (!recent.length) continue;
-      const avgVal = recent.reduce((acc, r) => {
-        const c = num(pick(r, ["Close","close","endPrice","AdjustedClose","adjusted_close"]));
-        const v = num(pick(r, ["Volume","volume","turnoverVolume"]));
-        return acc + c * v;
-      }, 0) / recent.length;
-      if (avgVal >= minVal) out.push({ code, name: it.company_name || it.Name || it.companyName || "", market: it.market || it.Market || "", avg_trading_value: Math.round(avgVal) });
-    }
-    out.sort((a,b)=> b.avg_trading_value - a.avg_trading_value);
-    safeJson(res, 200, { count: out.length, items: out });
-  } catch (e) { safeJson(res, 500, { error: String(e.message || e) }); }
-}
-
-// ===== screen/basic =====
-async function calcAvgTradingValue(idToken, code, lookbackDays = 20) {
-  const to = new Date(); const from = new Date(to.getTime() - 90*24*60*60_000);
-  const fmt=(d)=>d.toISOString().slice(0,10).replace(/\D/g,"");
-  const data=await jqFetch("/prices/daily_quotes",{code,from:fmt(from),to:fmt(to)},idToken);
-  const rows=Array.isArray(data)?data:(data.daily_quotes||data.data||[]);
-  const recent=rows.slice(-lookbackDays); if(!recent.length) return 0;
-  const avg=recent.reduce((a,r)=> a + num(pick(r,["Close","close","endPrice","AdjustedClose","adjusted_close"])) * num(pick(r,["Volume","volume","turnoverVolume"])), 0)/recent.length;
-  return Math.round(avg);
-}
-async function calcMomentum(idToken, code) {
-  const to=new Date(); const from=new Date(to.getTime() - 400*24*60*60_000);
-  const fmt=(d)=>d.toISOString().slice(0,10).replace(/\D/g,"");
-  const data=await jqFetch("/prices/daily_quotes",{code,from:fmt(from),to:fmt(to)},idToken);
-  const rows=Array.isArray(data)?data:(data.daily_quotes||data.data||[]);
-  if(rows.length<40) return { r1m:0,r3m:0,r6m:0,r12m:0 };
-  const close=(r)=> num(pick(r,["Close","close","endPrice","AdjustedClose","adjusted_close"]));
-  const last=close(rows[rows.length-1]);
-  const findAgo=(days)=> close(rows[Math.max(rows.length - 1 - Math.round(days),0)]);
-  const ret=(cur,prev)=> (prev>0? (cur/prev - 1) : 0);
-  return { r1m:ret(last,findAgo(21)), r3m:ret(last,findAgo(63)), r6m:ret(last,findAgo(126)), r12m:ret(last,findAgo(252)) };
-}
-function scoreRow(x){
-  let s=0;
-  const lv=Math.min(1,Math.max(0,(x.avg_trading_value-1e8)/(5e8-1e8))); s += lv*20;
-  if(x.per){ s += Math.min(1,Math.max(0,(15-x.per)/(15-6)))*15; }
-  if(x.pbr){ s += Math.min(1,Math.max(0,(1.2-x.pbr)/(1.2-0.6)))*15; }
-  const clip=(v,lo,hi)=>Math.min(hi,Math.max(lo,v));
-  const scale=(v,lo,hi)=>(clip(v,lo,hi)-lo)/(hi-lo);
-  s += scale(x.mom_3m||0, -0.10, 0.20) * 15;
-  s += scale(x.mom_6m||0, -0.10, 0.20) * 15;
-  s += Math.min(1,(x.dividend_yield||0)/0.04)*20;
-  return Math.round(s);
-}
-async function handleScreenBasic(req,res){
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try{
-    const url=safeParseURL(req);
-    const market=(url.searchParams.get("market")||"All").trim();
-    const limit=Number(url.searchParams.get("limit")||"30");
-    const liqMin=Number(url.searchParams.get("liquidity_min")||"100000000");
-    const perLt=url.searchParams.get("per_lt");
-    const pbrLt=url.searchParams.get("pbr_lt");
-    const divGt=url.searchParams.get("div_yield_gt");
-    const mom3Gt=url.searchParams.get("mom3m_gt");
-
-    const idToken=await ensureIdToken();
-    const uni=await jqFetch("/listed/info",{},idToken);
-    let list=Array.isArray(uni)?uni:(uni.info||uni.data||[]);
-    if(market && market!=="All"){
-      const mkey=market.toLowerCase();
-      list=list.filter(x=>(x.market||x.market_code||"").toString().toLowerCase().includes(mkey));
-    }
-    const sample=list.slice(0,Math.min(300,list.length));
-    const out=[];
-    for(const it of sample){
-      const code=it.code||it.Symbol||it.symbol||it.Code;
-      const name=it.company_name||it.Name||it.companyName||"";
-      if(!code) continue;
-      try{
-        const [avgVal, fs, lastClose, mom] = await Promise.all([
-          calcAvgTradingValue(idToken, code, 20),
-          jqFetch("/fins/statements",{code},idToken),
-          fetchLatestClose(idToken, code),
-          calcMomentum(idToken, code),
-        ]);
-        if(avgVal<liqMin) continue;
-        const rows0=Array.isArray(fs)?fs:(fs.statements||fs.data||[]);
-        if(!rows0.length) continue;
-        const rows=[...rows0].sort(sortRecent);
-        const perShare=extractPerShareLatest(rows);
-
-        const per=(perShare.eps>0)?(lastClose/perShare.eps):null;
-        const pbr=(perShare.bps>0)?(lastClose/perShare.bps):null;
-        const divYield=(perShare.dps>0 && lastClose>0)?(perShare.dps/lastClose):0;
-
-        if(perLt && per!=null && !(per<Number(perLt))) continue;
-        if(pbrLt && pbr!=null && !(pbr<Number(pbrLt))) continue;
-        if(divGt && !(divYield>=Number(divGt))) continue;
-        if(mom3Gt && !((mom.r3m||0)>=Number(mom3Gt))) continue;
-
-        const row={ code,name,per,pbr,dividend_yield:divYield,mom_3m:mom.r3m,mom_6m:mom.r6m,mom_12m:mom.r12m,avg_trading_value:avgVal };
-        row.score=scoreRow(row);
-        out.push(row);
-      }catch(e){ logWarn("screen_basic.row_skip",{code,err:String(e).slice(0,300)}); continue; }
-    }
-    out.sort((a,b)=>b.score-a.score);
-    safeJson(res,200,{ count: out.length, items: out.slice(0,limit) });
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
-}
-
-// ===== portfolio: summary (multi-codes) =====
-async function handlePortfolioSummary(req, res) {
-  if (!requireProxyBearer(req)) return safeJson(res, 401, { error: "Unauthorized" });
-  try {
-    const url = safeParseURL(req);
-    const codesParam = (url.searchParams.get("codes") || "").trim();
-    if (!codesParam) return safeJson(res, 400, { error: "Missing codes (comma-separated)" });
-    const withCredit = (url.searchParams.get("with_credit") || "0") === "1";
-
-    const codes = codesParam.split(",").map(s => s.trim()).filter(Boolean);
-    if (!codes.length) return safeJson(res, 400, { error: "No valid codes" });
-
-    const cacheKey = `portfolio:summary:${codes.slice().sort().join(",")}:${withCredit?"1":"0"}`;
-    const hit = getCached(cacheKey);
-    if (hit) return safeJson(res, 200, hit);
-
-    const idToken = await ensureIdToken();
-
-    const items = [];
-    for (const code of codes) {
-      try {
-        const [fs, lastClose] = await Promise.all([
-          jqFetch("/fins/statements", { code }, idToken),
-          fetchLatestClose(idToken, code),
-        ]);
-        const rows0 = Array.isArray(fs) ? fs : (fs.statements || fs.data || []);
-        if (!rows0.length) { items.push({ code, error: "No statements" }); continue; }
-        const rows = [...rows0].sort(sortRecent);
-
-        const ttm = ttmFromQuarterly(rows, {
-          ni: ["NetIncome","netIncome","Profit","profit","ProfitAttributableToOwnersOfParent","netIncomeAttributableToOwnersOfParent"],
-        });
-        const shares = num(pick(rows[0], ["SharesOutstanding","sharesOutstanding","NumberOfIssuedAndOutstandingShares","issuedShares"]));
-        const perShare = extractPerShareLatest(rows);
-        const epsTTM = (shares > 0 && ttm.ni) ? (ttm.ni / shares) : perShare.eps;
-
-        const per  = epsTTM > 0 ? (lastClose / epsTTM) : null;
-        const pbr  = perShare.bps > 0 ? (lastClose / perShare.bps) : null;
-        const yld  = (perShare.dps > 0 && lastClose > 0) ? (perShare.dps / lastClose) : 0;
-
-        const base = { code, close: lastClose, per, pbr, dividend_yield: yld, eps_ttm: epsTTM, bps: perShare.bps, dps: perShare.dps };
-
-        if (!withCredit) { items.push(base); continue; }
-
-        // 週次信用の最新だけ添付（軽量）
-        let credit = null;
-        try {
-          const raw = await jqFetch("/markets/weekly_margin_interest", { code }, idToken);
-          const rowsC = Array.isArray(raw) ? raw : (raw.weekly_margin_interest || raw.data || []);
-          rowsC.sort((a,b)=> String((b.Date||b.date||"")).localeCompare(String((a.Date||a.date||""))));
-          const r0 = rowsC[0];
-          if (r0) {
-            const buy  = num(r0.BuyingOnMargin || r0.margin_buying || r0.buying_on_margin);
-            const sell = num(r0.SellingOnMargin || r0.margin_selling || r0.selling_on_margin);
-            credit = { date: r0.Date || r0.date, buying: buy, selling: sell, net: buy - sell };
-          }
-        } catch (_) {}
-        items.push({ ...base, credit_latest: credit });
-      } catch (e) {
-        logWarn("portfolio.summary.row_skip", { code, err: String(e).slice(0,300) });
-        items.push({ code, error: "fetch_failed" });
-      }
-    }
-
-    const payload = { count: items.length, items };
-    setCached(cacheKey, payload, 3 * 60 * 60_000);
-    safeJson(res, 200, payload);
-  } catch (e) {
-    safeJson(res, 500, { error: String(e.message || e) });
+// 上場一覧（市場・名称取り）
+async function getListedMap() {
+  const j = await jqGET(`/listed/info`);
+  const info = j.info || [];
+  const map = new Map();
+  for (const r of info) {
+    const code = codeStr(pick(r, "Code", "code"));
+    const name = String(pick(r, "CompanyName", "name") || "");
+    const marketJa = String(pick(r, "MarketCodeName", "market", "Market") || ""); // 例: プライム/スタンダード/グロース
+    map.set(code, { code, name, marketJa });
   }
+  return map;
 }
 
-// ===== router =====
-export default async function handler(req,res){
-  try{
-    const raw = typeof req?.url === "string" ? req.url : "/";
-    const pathOnly = raw.split("?")[0].replace(/\/+$/, "");
+function marketMatch(marketParam, marketJa) {
+  if (!marketParam || marketParam === "All") return true;
+  const m = marketParam.toLowerCase();
+  const ja = (marketJa || "").toLowerCase();
+  if (m === "prime") return ja.includes("プライム");
+  if (m === "standard") return ja.includes("スタンダード");
+  if (m === "growth") return ja.includes("グロース");
+  return true;
+}
 
-    if (pathOnly === "/api/health") return handleHealth(req,res);
+// ある日付（営業日）1日の全銘柄 TurnoverValue 集計
+async function fetchDailyQuotesByDate(dateStr) {
+  const j = await jqGET(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`);
+  const items = (j.daily_quotes || []).map(mapDailyQuote);
+  return items;
+}
 
-    if (pathOnly === "/api/auth/refresh" && (req.method==="POST"||req.method==="GET")) return handleAuthRefresh(req,res);
-    if (pathOnly === "/api/universe/listed" && req.method==="GET") return handleUniverseListed(req,res);
-    if (pathOnly === "/api/prices/daily" && req.method==="GET") return handlePricesDaily(req,res);
+// 直近N営業日での平均売買代金（TurnoverValue平均）と最新終値
+async function buildLiquidityAndClose(days = 20) {
+  const dates = await getRecentTradingDates(days);
+  if (dates.length === 0) return { avgTV: new Map(), latestClose: new Map() };
 
-    if (pathOnly === "/api/fins/statements" && req.method==="GET") return handleFinsStatements(req,res);
+  const sumTV = new Map();
+  let lastDayClose = new Map();
 
-    if (pathOnly === "/api/credit/weekly" && req.method==="GET") return handleCreditWeekly(req,res);
-    if (pathOnly === "/api/credit/daily_public" && req.method==="GET") return handleCreditDailyPublic(req,res);
+  for (let i = 0; i < dates.length; i++) {
+    const dt = dates[i];
+    const items = await fetchDailyQuotesByDate(dt);
+    if (i === dates.length - 1) {
+      lastDayClose = new Map(items.map(it => [codeStr(it.code), it.close]));
+    }
+    for (const it of items) {
+      const code = codeStr(it.code);
+      const v = it.turnover || 0;
+      if (!Number.isFinite(v)) continue;
+      sumTV.set(code, (sumTV.get(code) || 0) + v);
+    }
+  }
+  const avgTV = new Map();
+  for (const [code, total] of sumTV.entries()) {
+    avgTV.set(code, total / dates.length);
+  }
+  return { avgTV, latestClose: lastDayClose };
+}
 
-    if (pathOnly === "/api/screen/liquidity" && req.method==="GET") return handleScreenLiquidity(req,res);
-    if (pathOnly === "/api/screen/basic" && req.method==="GET") return handleScreenBasic(req,res);
+// 3/6/12か月モメンタム（終値の比率 - 1）。基準日と過去営業日スナップショットだけで計算（全銘柄一括取得）
+async function buildMomentumSnapshots() {
+  const dates = await getRecentTradingDates(260); // 約1年ぶん
+  if (dates.length === 0) return { d0: new Map() };
 
-    if (pathOnly === "/api/portfolio/summary" && req.method==="GET") return handlePortfolioSummary(req,res);
+  const idx = dates.length - 1;                    // 最新
+  const idx3m = Math.max(0, dates.length - 63);    // おおよそ3ヶ月（63営業日）
+  const idx6m = Math.max(0, dates.length - 126);   // 約6ヶ月
+  const idx12m = Math.max(0, dates.length - 252);  // 約12ヶ月
 
-    res.statusCode=404; res.end("Not Found");
-  }catch(e){ safeJson(res,500,{error:String(e.message||e)}); }
+  const [dq0, dq3, dq6, dq12] = await Promise.all([
+    fetchDailyQuotesByDate(dates[idx]),
+    fetchDailyQuotesByDate(dates[idx3m]),
+    fetchDailyQuotesByDate(dates[idx6m]),
+    fetchDailyQuotesByDate(dates[idx12m]),
+  ]);
+
+  const toMap = (arr) => new Map(arr.map(it => [codeStr(it.code), it.close]));
+  return {
+    d0: toMap(dq0),
+    d3: toMap(dq3),
+    d6: toMap(dq6),
+    d12: toMap(dq12),
+    dates: { d0: dates[idx], d3: dates[idx3m], d6: dates[idx6m], d12: dates[idx12m] }
+  };
+}
+
+function calcReturn(nowClose, pastClose) {
+  const a = parseFloatSafe(nowClose);
+  const b = parseFloatSafe(pastClose);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
+  return a / b - 1;
+}
+
+// 直近4期 EPS/BPS/DPS の合成（TTM/最新推定）
+function summarizeFins(statements) {
+  if (!Array.isArray(statements) || statements.length === 0) {
+    return { eps_ttm: null, bps: null, dps: null, roe: null, roa: null };
+  }
+  // 開示日降順でソート（念のため）
+  const items = [...statements].sort((a, b) => {
+    const da = normalizeJQDateStr(pick(a, "DisclosedDate", "disclosedDate"));
+    const db = normalizeJQDateStr(pick(b, "DisclosedDate", "disclosedDate"));
+    return db.localeCompare(da);
+  });
+
+  // EPSは四半期のEarningsPerShareを最大4つ合算（TTM）
+  const epsVals = [];
+  for (const it of items) {
+    const e = parseFloatSafe(pick(it, "EarningsPerShare", "eps", "EPS"));
+    if (e != null) epsVals.push(e);
+    if (epsVals.length >= 4) break;
+  }
+  const eps_ttm = epsVals.length ? epsVals.reduce((a, b) => a + b, 0) : null;
+
+  // BPS（BookValuePerShare）があれば最新を採用
+  const bps = parseFloatSafe(pick(items[0] || {}, "BookValuePerShare", "bps", "BPS")) ?? null;
+
+  // 配当は ResultDividendPerShareAnnual または ForecastDividendPerShareAnnual を優先
+  const dps = parseFloatSafe(
+    pick(items[0] || {},
+      "ResultDividendPerShareAnnual",
+      "ForecastDividendPerShareAnnual",
+      "dps", "DPS")
+  ) ?? null;
+
+  // ROE/ROA（もし項目があれば単純取得。J-Quants statements には固定で項目が無い場合が多い。）
+  const roe = parseFloatSafe(pick(items[0] || {}, "ROE", "roe"));
+  const roa = parseFloatSafe(pick(items[0] || {}, "ROA", "roa"));
+
+  return { eps_ttm, bps, dps, roe, roa };
+}
+
+async function fetchFinsStatementsByCode(code) {
+  const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`);
+  return j.statements || [];
+}
+
+// ==============================
+// ルーティング
+// ==============================
+export default async function handler(req, res) {
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const path = url.pathname.replace(/\/+$/, "");
+    dlog("path", path);
+
+    // CORS (必要なら調整)
+    if (req.method === "OPTIONS") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      return res.status(204).end();
+    }
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    // /api/health は無認可でOK（稼働確認用）
+    if (path === "/api/health") {
+      return json(res, 200, {
+        ok: true,
+        ts: new Date().toISOString(),
+        idToken_valid_ms: msUntilExp(),
+        version: VERSION
+      });
+    }
+
+    // それ以外はプロキシ用ベアラー必須
+    if (!requireProxyAuth(req, res)) return;
+
+    if (path === "/api/auth/refresh" && req.method === "POST") {
+      const body = typeof req.body === "object" ? req.body : {};
+      // 任意で body.refreshToken / body.refreshtoken を受け付け
+      const override = body?.refreshToken || body?.refreshtoken;
+      const out = await refreshIdToken(override);
+      return json(res, 200, out);
+    }
+
+    if (path === "/api/prices/daily" && req.method === "GET") {
+      const code = url.searchParams.get("code");
+      const from = url.searchParams.get("from");
+      const to = url.searchParams.get("to");
+      if (!code) return json(res, 400, { error: "code is required" });
+
+      const q = new URLSearchParams({ code });
+      if (from) q.set("from", from);
+      if (to) q.set("to", to);
+
+      const j = await jqGET(`/prices/daily_quotes?${q.toString()}`);
+      // そのまま返す（JQのキーを温存）
+      return json(res, 200, j);
+    }
+
+    if (path === "/api/fins/statements" && req.method === "GET") {
+      const code = url.searchParams.get("code");
+      if (!code) return json(res, 400, { error: "code is required" });
+
+      const stmts = await fetchFinsStatementsByCode(code);
+      const sum = summarizeFins(stmts);
+
+      // 終値・時価総額・PER/PBR/配当利回り 算出（可能な範囲）
+      const latestDate = await getLatestTradingDate();
+      const dq = await fetchDailyQuotesByDate(latestDate);
+      const me = dq.find(r => codeStr(r.code) === codeStr(code));
+      const close = me?.close ?? null;
+
+      let marketCap = null, per = null, pbr = null, dividend_yield = null;
+      // 発行株数が取れないので marketCap は不明（必要なら別API/自前保存）
+      // PER/PBR/配当利回りは Close と EPS/BPS/DPS があれば単純算出
+      if (Number.isFinite(close)) {
+        if (sum.eps_ttm != null && sum.eps_ttm !== 0) per = close / sum.eps_ttm;
+        if (sum.bps != null && sum.bps !== 0) pbr = close / sum.bps;
+        if (sum.dps != null && close !== 0) dividend_yield = sum.dps / close;
+      }
+
+      return json(res, 200, {
+        summary: {
+          code: codeStr(code),
+          close,
+          marketCap,
+          eps_ttm: sum.eps_ttm,
+          bps: sum.bps,
+          dps: sum.dps,
+          per,
+          pbr,
+          dividend_yield,
+          roe: sum.roe,
+          roa: sum.roa,
+        },
+        raw_count: stmts.length
+      });
+    }
+
+    if (path === "/api/credit/weekly" && req.method === "GET") {
+      const code = url.searchParams.get("code");
+      const weeks = parseIntSafe(url.searchParams.get("weeks")) || 26;
+      if (!code) return json(res, 400, { error: "code is required" });
+
+      const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`);
+      let items = (j.weekly_margin_interest || []).map(mapWeeklyMargin);
+      // 昇順に整えて、末尾から weeks 件
+      items.sort((a, b) => a.date.localeCompare(b.date));
+      if (items.length > weeks) items = items.slice(items.length - weeks);
+
+      const latest = items[items.length - 1] || {};
+      const prev = items[items.length - 2] || {};
+      const metrics = {
+        code: codeStr(code),
+        latest: latest.date ? latest : {
+          date: null, buying: null, selling: null, net: null, ratio: null
+        },
+        wow_change: {
+          buying: (latest.buying != null && prev.buying != null) ? latest.buying - prev.buying : null,
+          selling: (latest.selling != null && prev.selling != null) ? latest.selling - prev.selling : null,
+          net: (latest.net != null && prev.net != null) ? latest.net - prev.net : null,
+        }
+      };
+
+      return json(res, 200, {
+        code: codeStr(code),
+        count: items.length,
+        metrics,
+        items
+      });
+    }
+
+    if (path === "/api/credit/daily_public" && req.method === "GET") {
+      const code = url.searchParams.get("code");
+      const days = parseIntSafe(url.searchParams.get("days")) || 60;
+      if (!code) return json(res, 400, { error: "code is required" });
+
+      // from/to は日付で切って良い（営業日でなくてもAPI側で調整される）
+      const today = new Date();
+      const to = today.toISOString().slice(0, 10);
+      const fromDate = new Date(today.getTime() - (days + 20) * 24 * 60 * 60 * 1000);
+      const from = fromDate.toISOString().slice(0, 10);
+
+      const q = new URLSearchParams({ code, from, to });
+      const j = await jqGET(`/markets/daily_margin_interest?${q.toString()}`);
+      let items = (j.daily_margin_interest || []).map(mapDailyPublic);
+      items.sort((a, b) => a.date.localeCompare(b.date));
+      if (items.length > days) items = items.slice(items.length - days);
+
+      return json(res, 200, {
+        code: codeStr(code),
+        count: items.length,
+        items
+      });
+    }
+
+    if (path === "/api/screen/liquidity" && req.method === "GET") {
+      const market = url.searchParams.get("market") || "All";
+      const minAvg = parseIntSafe(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
+      const days = parseIntSafe(url.searchParams.get("days")) ?? 20;
+
+      const [listedMap, liq] = await Promise.all([getListedMap(), buildLiquidityAndClose(days)]);
+      const out = [];
+
+      for (const [code, avg_trading_value] of liq.avgTV.entries()) {
+        const meta = listedMap.get(code) || { name: "", marketJa: "" };
+        if (!marketMatch(market, meta.marketJa)) continue;
+        if (!Number.isFinite(avg_trading_value) || avg_trading_value < minAvg) continue;
+
+        out.push({
+          code,
+          name: meta.name,
+          market: meta.marketJa,
+          avg_trading_value: Math.round(avg_trading_value)
+        });
+      }
+
+      out.sort((a, b) => b.avg_trading_value - a.avg_trading_value);
+      return json(res, 200, { count: out.length, items: out });
+    }
+
+    if (path === "/api/screen/basic" && req.method === "GET") {
+      const market = url.searchParams.get("market") || "All";
+      const limit = Math.min(Math.max(parseIntSafe(url.searchParams.get("limit")) || 30, 1), 200);
+      const liquidity_min = parseIntSafe(url.searchParams.get("liquidity_min")) ?? 100_000_000;
+      const per_lt = url.searchParams.get("per_lt") != null ? parseFloatSafe(url.searchParams.get("per_lt")) : null;
+      const pbr_lt = url.searchParams.get("pbr_lt") != null ? parseFloatSafe(url.searchParams.get("pbr_lt")) : null;
+      const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? parseFloatSafe(url.searchParams.get("div_yield_gt")) : null;
+      const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? parseFloatSafe(url.searchParams.get("mom3m_gt")) : null;
+
+      const [listedMap, { avgTV, latestClose }, momSnaps] = await Promise.all([
+        getListedMap(),
+        buildLiquidityAndClose(20),
+        buildMomentumSnapshots()
+      ]);
+
+      const items = [];
+      for (const [code, avg_trading_value] of avgTV.entries()) {
+        const meta = listedMap.get(code) || { name: "", marketJa: "" };
+        if (!marketMatch(market, meta.marketJa)) continue;
+        if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
+
+        // モメンタム計算
+        const mom_3m = calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code));
+        const mom_6m = calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code));
+        const mom_12m = calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code));
+
+        if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
+
+        // バリュー系（必要時のみ計算）—— per/pbr/yield 指定があれば statements 呼び
+        let per = null, pbr = null, dividend_yield = null, eps_ttm = null, bps = null, dps = null;
+        if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
+          try {
+            const stmts = await fetchFinsStatementsByCode(code);
+            const s = summarizeFins(stmts);
+            eps_ttm = s.eps_ttm; bps = s.bps; dps = s.dps;
+            const close = latestClose.get(code);
+            if (Number.isFinite(close)) {
+              if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
+              if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
+              if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
+            }
+          } catch (e) {
+            dlog("fins fetch failed for", code, e.message);
+          }
+
+          if (per_lt != null && !(per != null && per < per_lt)) continue;
+          if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
+          if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
+        }
+
+        // 簡易スコア（流動性 + 3mモメンタムを主軸）
+        const liqScore = Math.log10(Math.max(1, avg_trading_value));
+        const momScore = (mom_3m == null ? 0 : mom_3m * 100);
+        const score = Math.round(10 * (liqScore + momScore));
+
+        items.push({
+          code,
+          name: meta.name,
+          per, pbr, dividend_yield,
+          mom_3m, mom_6m, mom_12m,
+          avg_trading_value: Math.round(avg_trading_value),
+          score
+        });
+      }
+
+      items.sort((a, b) => b.score - a.score);
+      const sliced = items.slice(0, limit);
+      return json(res, 200, { count: sliced.length, items: sliced });
+    }
+
+    if (path === "/api/portfolio/summary" && req.method === "GET") {
+      const codesParam = url.searchParams.get("codes");
+      const with_credit = parseIntSafe(url.searchParams.get("with_credit")) === 1;
+      if (!codesParam) return json(res, 400, { error: "codes is required (comma-separated)" });
+
+      const codes = codesParam.split(",").map(s => codeStr(s.trim())).filter(Boolean);
+      const [listedMap, latestDate] = await Promise.all([getListedMap(), getLatestTradingDate()]);
+      const dq = await fetchDailyQuotesByDate(latestDate);
+      const closeMap = new Map(dq.map(it => [codeStr(it.code), it.close]));
+
+      const out = [];
+      for (const code of codes) {
+        let close = closeMap.get(code) ?? null;
+        let per = null, pbr = null, dividend_yield = null, eps_ttm = null, bps = null, dps = null;
+        let credit_latest = null;
+        let error = null;
+
+        try {
+          const stmts = await fetchFinsStatementsByCode(code);
+          const s = summarizeFins(stmts);
+          eps_ttm = s.eps_ttm; bps = s.bps; dps = s.dps;
+
+          if (Number.isFinite(close)) {
+            if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
+            if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
+            if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
+          }
+        } catch (e) {
+          error = e.message;
+        }
+
+        if (with_credit) {
+          try {
+            const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`);
+            const arr = (j.weekly_margin_interest || []).map(mapWeeklyMargin).sort((a, b) => a.date.localeCompare(b.date));
+            credit_latest = arr[arr.length - 1] || null;
+          } catch (e) {
+            error = (error ? error + "; " : "") + e.message;
+          }
+        }
+
+        out.push({
+          code,
+          close, per, pbr, dividend_yield,
+          eps_ttm, bps, dps,
+          credit_latest,
+          error: error || null
+        });
+      }
+
+      return json(res, 200, { count: out.length, items: out });
+    }
+
+    // 未対応
+    return json(res, 404, { error: `No route for ${path}` });
+  } catch (e) {
+    console.error(e);
+    return json(res, 500, { error: e.message || "Internal error" });
+  }
 }
