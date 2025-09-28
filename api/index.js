@@ -1,35 +1,48 @@
 // api/index.js
-// J-Quants Proxy (Screening) - full replacement
-// Vercel Node.js (Edge ではなく Node.js) 用。必要に応じて runtime 設定は vercel.json/next.config.js 側で。
-// Env 必須:
-//   - PROXY_BEARER:     プロキシ利用時のベアラートークン（クライアント→このプロキシ）
-//   - JQ_REFRESH_TOKEN: J-Quants の refreshToken（/token/auth_user かメニューから取得）
-// 任意:
-//   - LOG_LEVEL: debug にすると各種ログが少し出ます
+// J-Quants JP Proxy (Screening) — full replacement
+// 必須Env: PROXY_BEARER
+// どちらか: (A) JQ_REFRESH_TOKEN  または  (B) JQ_MAIL + JQ_PASSWORD
+// 任意Env: LOG_LEVEL=debug で簡易デバッグログ
+//
+// 実装の要点:
+// - /token/auth_user (週1): refreshToken を取得してキャッシュ（メール/パスワードでの自動ブートストラップ）
+// - /token/auth_refresh (24h): idToken を取得してキャッシュ
+// - 日次株価は TurnoverValue を採用、信用残は Long/Short* の正式キーに対応
+// - 市場は MarketCodeName（プライム/スタンダード/グロース）を採用
+// - CORS 設定あり、プロキシ用 Bearer を各APIで要求
 
 const JQ_BASE = "https://api.jquants.com/v1";
-const VERSION = "1.0.8-fix-keys";
+const VERSION = "1.0.9-full";
 
+// ———————————————————————— ユーティリティ
 const isDebug = () => (process.env.LOG_LEVEL || "").toLowerCase() === "debug";
 const dlog = (...args) => { if (isDebug()) console.log("[DEBUG]", ...args); };
 
-// ==============================
-// 内部トークンキャッシュ
-// ==============================
+function json(res, code, obj) { res.status(code).json(obj); }
+function now() { return Date.now(); }
+
+function pick(v, ...keys) {
+  for (const k of keys) {
+    if (v != null && Object.prototype.hasOwnProperty.call(v, k) && v[k] != null) return v[k];
+  }
+  return undefined;
+}
+function toInt(x) { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : null; }
+function toNum(x) {
+  if (x === "-" || x === "*" || x === "" || x == null) return null;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+function codeStr(x) { return String(x || "").padStart(4, "0"); }
+function normDateStr(s) { return typeof s === "string" ? s : String(s || ""); }
+
+// ———————————————————————— 認証（refreshToken / idToken キャッシュ）
+let REFRESH_TOKEN = process.env.JQ_REFRESH_TOKEN || null;
+let REFRESH_TOKEN_EXP_AT = REFRESH_TOKEN ? 0 : 0; // 環境変数の場合は期限不明(0=未知)
 let ID_TOKEN = null;
-let ID_TOKEN_EXP_AT = 0; // epoch ms
+let ID_TOKEN_EXP_AT = 0;
 
-function json(res, code, obj) {
-  res.status(code).json(obj);
-}
-
-function now() {
-  return Date.now();
-}
-
-function msUntilExp() {
-  return Math.max(0, (ID_TOKEN_EXP_AT || 0) - now());
-}
+function msUntilExp() { return Math.max(0, (ID_TOKEN_EXP_AT || 0) - now()); }
 
 function requireProxyAuth(req, res) {
   const header = req.headers["authorization"] || req.headers["Authorization"];
@@ -45,38 +58,89 @@ function requireProxyAuth(req, res) {
   return true;
 }
 
+// refreshToken をメール/パスワードから取得（週1回想定）
+async function fetchRefreshTokenFromUserPass() {
+  const mail = process.env.JQ_MAIL;
+  const pass = process.env.JQ_PASSWORD;
+  if (!mail || !pass) throw new Error("Missing JQ_MAIL / JQ_PASSWORD");
+
+  const r = await fetch(`${JQ_BASE}/token/auth_user`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mailaddress: mail, password: pass }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.refreshToken) {
+    throw new Error(`auth_user failed: ${r.status} ${JSON.stringify(j)}`);
+  }
+  // 1週間有効（安全側に -10分）
+  REFRESH_TOKEN = j.refreshToken;
+  REFRESH_TOKEN_EXP_AT = Date.now() + 7 * 24 * 60 * 60 * 1000 - 10 * 60 * 1000;
+  dlog("refreshToken issued (masked)");
+  return REFRESH_TOKEN;
+}
+function refreshTokenValid() {
+  return !!REFRESH_TOKEN && (REFRESH_TOKEN_EXP_AT === 0 || REFRESH_TOKEN_EXP_AT > Date.now());
+}
+let inflightGetRT = null;
+async function ensureRefreshToken() {
+  if (refreshTokenValid()) return REFRESH_TOKEN;
+  if (inflightGetRT) return inflightGetRT; // 同時実行デデュープ
+  inflightGetRT = (async () => {
+    if (process.env.JQ_REFRESH_TOKEN && !REFRESH_TOKEN) {
+      // env に固定が入っている場合はそれを採用（期限は未知）
+      REFRESH_TOKEN = process.env.JQ_REFRESH_TOKEN;
+      REFRESH_TOKEN_EXP_AT = 0;
+      return REFRESH_TOKEN;
+    }
+    return await fetchRefreshTokenFromUserPass();
+  })();
+  try { return await inflightGetRT; } finally { inflightGetRT = null; }
+}
+
+let inflightGetID = null;
 async function refreshIdToken(maybeRefreshToken) {
-  const refreshToken = maybeRefreshToken || process.env.JQ_REFRESH_TOKEN;
-  if (!refreshToken) throw new Error("JQ_REFRESH_TOKEN is not set");
+  // 有効な refreshToken を確保
+  const refreshToken = maybeRefreshToken || await ensureRefreshToken();
 
   const url = `${JQ_BASE}/token/auth_refresh?refreshtoken=${encodeURIComponent(refreshToken)}`;
   const r = await fetch(url, { method: "POST" });
   const t = await r.json().catch(() => ({}));
 
-  if (!r.ok) {
-    throw new Error(`auth_refresh failed: ${r.status} ${JSON.stringify(t)}`);
+  if (!r.ok || !t.idToken) {
+    // refreshToken が期限切れ/無効など → 再発行して再試行
+    REFRESH_TOKEN = null; REFRESH_TOKEN_EXP_AT = 0;
+    const rt2 = await ensureRefreshToken();
+    const r2 = await fetch(`${JQ_BASE}/token/auth_refresh?refreshtoken=${encodeURIComponent(rt2)}`, { method: "POST" });
+    const t2 = await r2.json().catch(() => ({}));
+    if (!r2.ok || !t2.idToken) {
+      throw new Error(`auth_refresh failed: ${r2.status} ${JSON.stringify(t2)}`);
+    }
+    ID_TOKEN = t2.idToken;
+  } else {
+    ID_TOKEN = t.idToken;
   }
-
-  const idToken = t.idToken;
-  if (!idToken) throw new Error("auth_refresh success but idToken missing");
-
-  // JQのIDトークンは有効期間24h。安全側に -5分 の猶予。
-  ID_TOKEN = idToken;
-  ID_TOKEN_EXP_AT = now() + 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
-
+  // 24h有効（安全側 -5分）
+  ID_TOKEN_EXP_AT = Date.now() + 24 * 60 * 60 * 1000 - 5 * 60 * 1000;
   return { idToken: ID_TOKEN, expAt: ID_TOKEN_EXP_AT };
 }
-
 async function ensureIdToken() {
   if (ID_TOKEN && msUntilExp() > 0) return ID_TOKEN;
-  const { idToken } = await refreshIdToken();
-  return idToken;
+  if (inflightGetID) return inflightGetID; // 同時実行デデュープ
+  inflightGetID = (async () => (await refreshIdToken()).idToken)();
+  try { return await inflightGetID; } finally { inflightGetID = null; }
 }
 
-async function jqGET(pathWithQuery) {
-  const idToken = await ensureIdToken();
+// 任意: クライアントが idToken を直接渡してくる場合に優先使用
+function readIdTokenOverride(req) {
+  const h = req.headers["x-id-token"] || req.headers["X-ID-TOKEN"];
+  return typeof h === "string" && h.trim() ? h.trim() : null;
+}
+
+async function jqGET(pathWithQuery, idTokenOverride) {
+  const idToken = idTokenOverride || await ensureIdToken();
   const url = `${JQ_BASE}${pathWithQuery}`;
-  dlog("GET", url);
+  dlog("JQ GET", url);
   const r = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) {
@@ -86,139 +150,91 @@ async function jqGET(pathWithQuery) {
   return body;
 }
 
-function parseIntSafe(x) {
-  const n = typeof x === "string" ? parseInt(x, 10) : Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-function parseFloatSafe(x) {
-  if (x === "-" || x === "*" || x === "" || x == null) return null;
-  const n = typeof x === "string" ? parseFloat(x) : Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
-function pick(v, ...keys) {
-  for (const k of keys) {
-    if (v != null && Object.prototype.hasOwnProperty.call(v, k) && v[k] != null) return v[k];
-  }
-  return undefined;
-}
-
-function normalizeJQDateStr(s) {
-  // "2024-09-01" も "20240901" も来るので一応文字列返し
-  return typeof s === "string" ? s : String(s || "");
-}
-
+// ———————————————————————— JQ データマッピング
 function mapDailyQuote(rec) {
-  // J-Quantsのケーシング（先頭大文字）に対応、下位互換キーにもフォールバック
-  const date = normalizeJQDateStr(pick(rec, "Date", "date"));
-  const code = String(pick(rec, "Code", "code") || "");
-  const close = parseFloatSafe(pick(rec, "Close", "close"));
-  const turnover = parseFloatSafe(pick(rec, "TurnoverValue", "trading_value", "turnoverValue"));
-  return { date, code, close, turnover };
+  return {
+    date: normDateStr(pick(rec, "Date", "date")),
+    code: String(pick(rec, "Code", "code") || ""),
+    close: toNum(pick(rec, "Close", "EndPrice", "close", "endPrice", "AdjustedClose", "adjusted_close")),
+    turnover: toNum(pick(rec, "TurnoverValue", "turnoverValue", "trading_value"))
+  };
 }
-
 function mapWeeklyMargin(rec) {
-  // 週次信用残
-  const date = normalizeJQDateStr(pick(rec, "Date", "date"));
-  const code = String(pick(rec, "Code", "code") || "");
-  const buying = parseFloatSafe(
-    pick(
-      rec,
-      "LongMarginTradeVolume",
-      "long_margin_trade_volume",
-      "buying" // 万一自前計算の再入力にも備える
-    )
-  ) || 0;
-  const selling = parseFloatSafe(
-    pick(
-      rec,
-      "ShortMarginTradeVolume",
-      "short_margin_trade_volume",
-      "selling"
-    )
-  ) || 0;
-  const net = Number.isFinite(buying) && Number.isFinite(selling) ? (buying - selling) : null;
-  const ratio = buying ? (selling / buying) : null; // 比率（％ではなく倍率）
-  return { date, code, buying, selling, net, ratio };
+  const buy = toNum(pick(rec, "LongMarginTradeVolume", "long_margin_trade_volume", "buying"));
+  const sell = toNum(pick(rec, "ShortMarginTradeVolume", "short_margin_trade_volume", "selling"));
+  const buying = Number.isFinite(buy) ? buy : 0;
+  const selling = Number.isFinite(sell) ? sell : 0;
+  return {
+    date: normDateStr(pick(rec, "Date", "date")),
+    code: String(pick(rec, "Code", "code") || ""),
+    buying, selling,
+    net: (Number.isFinite(buying) && Number.isFinite(selling)) ? (buying - selling) : null,
+    ratio: buying ? (selling / buying) : null
+  };
 }
-
 function mapDailyPublic(rec) {
-  // 日々公表信用残
-  const date = normalizeJQDateStr(pick(rec, "PublishedDate", "Date", "date"));
-  const code = String(pick(rec, "Code", "code") || "");
-  const buying = parseFloatSafe(pick(rec, "LongMarginOutstanding", "long_margin_outstanding")) || 0;
-  const selling = parseFloatSafe(pick(rec, "ShortMarginOutstanding", "short_margin_outstanding")) || 0;
-  const net = Number.isFinite(buying) && Number.isFinite(selling) ? (buying - selling) : null;
-  const slrPct = parseFloatSafe(pick(rec, "ShortLongRatio", "short_long_ratio")); // 単位：％
-  const margin_rate = slrPct != null ? slrPct / 100 : null; // スキーマは ratio 相当、0-1 に正規化
-  return { date, code, buying, selling, net, margin_rate };
+  const buy = toNum(pick(rec, "LongMarginOutstanding", "long_margin_outstanding", "buying_on_margin"));
+  const sell = toNum(pick(rec, "ShortMarginOutstanding", "short_margin_outstanding", "selling_on_margin"));
+  const r = toNum(pick(rec, "ShortLongRatio", "short_long_ratio", "MarginRate", "margin_rate"));
+  return {
+    date: normDateStr(pick(rec, "PublishedDate", "Date", "date")),
+    code: String(pick(rec, "Code", "code") || ""),
+    buying: Number.isFinite(buy) ? buy : 0,
+    selling: Number.isFinite(sell) ? sell : 0,
+    net: (Number.isFinite(buy) && Number.isFinite(sell)) ? (buy - sell) : null,
+    margin_rate: (r != null ? (r > 1 ? r / 100 : r) : null) // ％で来た場合を 0-1 に正規化
+  };
 }
 
-function codeStr(x) {
-  return String(x || "").padStart(4, "0");
-}
-
-// 営業日（HolidayDivision 1:営業日 / 2:半日 も含める）
-async function getRecentTradingDates(nDays) {
-  const today = new Date();
-  const to = today.toISOString().slice(0, 10);
-  const fromDate = new Date(today.getTime() - 400 * 24 * 60 * 60 * 1000);
-  const from = fromDate.toISOString().slice(0, 10);
-
-  const cal = await jqGET(`/markets/trading_calendar?from=${from}&to=${to}`);
-  const list = (cal.trading_calendar || []).map(r => ({
-    date: normalizeJQDateStr(pick(r, "Date", "date")),
-    holiday: String(pick(r, "HolidayDivision", "holidayDivision", "Holiday")) // 念のため
-  }));
-
-  const biz = list.filter(d => d.holiday === "1" || d.holiday === "2").map(d => d.date);
-  // 後ろから nDays
-  const uniq = Array.from(new Set(biz)).sort(); // 昇順
-  const out = uniq.slice(Math.max(0, uniq.length - nDays));
-  dlog("trading dates picked", out.length);
-  return out;
-}
-
-// 最新の営業日
-async function getLatestTradingDate() {
-  const d = await getRecentTradingDates(1);
-  return d[0];
-}
-
-// 上場一覧（市場・名称取り）
-async function getListedMap() {
-  const j = await jqGET(`/listed/info`);
+// ———————————————————————— 上場銘柄/営業日/株価ユーティリティ
+async function getListedMap(idTokenOverride) {
+  const j = await jqGET(`/listed/info`, idTokenOverride);
   const info = j.info || [];
-  const map = new Map();
-  for (const r of info) {
-    const code = codeStr(pick(r, "Code", "code"));
-    const name = String(pick(r, "CompanyName", "name") || "");
-    const marketJa = String(pick(r, "MarketCodeName", "market", "Market") || ""); // 例: プライム/スタンダード/グロース
-    map.set(code, { code, name, marketJa });
+  const m = new Map();
+  for (const it of info) {
+    m.set(codeStr(pick(it, "Code", "code")), {
+      code: codeStr(pick(it, "Code", "code")),
+      name: String(pick(it, "CompanyName", "name") || ""),
+      marketJa: String(pick(it, "MarketCodeName", "Market", "market") || "")
+    });
   }
-  return map;
+  return m;
 }
-
 function marketMatch(marketParam, marketJa) {
   if (!marketParam || marketParam === "All") return true;
-  const m = marketParam.toLowerCase();
+  const want = (marketParam || "").toLowerCase();
   const ja = (marketJa || "").toLowerCase();
-  if (m === "prime") return ja.includes("プライム");
-  if (m === "standard") return ja.includes("スタンダード");
-  if (m === "growth") return ja.includes("グロース");
+  if (want === "prime")    return ja.includes("プライム");
+  if (want === "standard") return ja.includes("スタンダード");
+  if (want === "growth")   return ja.includes("グロース");
   return true;
 }
 
-// ある日付（営業日）1日の全銘柄 TurnoverValue 集計
-async function fetchDailyQuotesByDate(dateStr) {
-  const j = await jqGET(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`);
-  const items = (j.daily_quotes || []).map(mapDailyQuote);
-  return items;
+async function getRecentTradingDates(nDays, idTokenOverride) {
+  const today = new Date();
+  const to = today.toISOString().slice(0, 10);
+  const from = new Date(today.getTime() - 400 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const cal = await jqGET(`/markets/trading_calendar?from=${from}&to=${to}`, idTokenOverride);
+  const list = (cal.trading_calendar || []).map(r => ({
+    date: normDateStr(pick(r, "Date", "date")),
+    hol: String(pick(r, "HolidayDivision", "holidayDivision", "Holiday") || "")
+  }));
+  const biz = list.filter(x => x.hol === "1" || x.hol === "2").map(x => x.date);
+  const uniq = Array.from(new Set(biz)).sort(); // 昇順
+  return uniq.slice(Math.max(0, uniq.length - nDays));
+}
+async function getLatestTradingDate(idTokenOverride) {
+  const d = await getRecentTradingDates(1, idTokenOverride);
+  return d[0];
+}
+async function fetchDailyQuotesByDate(dateStr, idTokenOverride) {
+  const j = await jqGET(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`, idTokenOverride);
+  return (j.daily_quotes || []).map(mapDailyQuote);
 }
 
-// 直近N営業日での平均売買代金（TurnoverValue平均）と最新終値
-async function buildLiquidityAndClose(days = 20) {
-  const dates = await getRecentTradingDates(days);
+// 直近N営業日の平均売買代金（TurnoverValue）＋最新終値
+async function buildLiquidityAndClose(days = 20, idTokenOverride) {
+  const dates = await getRecentTradingDates(days, idTokenOverride);
   if (dates.length === 0) return { avgTV: new Map(), latestClose: new Map() };
 
   const sumTV = new Map();
@@ -226,10 +242,8 @@ async function buildLiquidityAndClose(days = 20) {
 
   for (let i = 0; i < dates.length; i++) {
     const dt = dates[i];
-    const items = await fetchDailyQuotesByDate(dt);
-    if (i === dates.length - 1) {
-      lastDayClose = new Map(items.map(it => [codeStr(it.code), it.close]));
-    }
+    const items = await fetchDailyQuotesByDate(dt, idTokenOverride);
+    if (i === dates.length - 1) lastDayClose = new Map(items.map(it => [codeStr(it.code), it.close]));
     for (const it of items) {
       const code = codeStr(it.code);
       const v = it.turnover || 0;
@@ -238,110 +252,82 @@ async function buildLiquidityAndClose(days = 20) {
     }
   }
   const avgTV = new Map();
-  for (const [code, total] of sumTV.entries()) {
-    avgTV.set(code, total / dates.length);
-  }
+  for (const [code, total] of sumTV.entries()) avgTV.set(code, total / dates.length);
   return { avgTV, latestClose: lastDayClose };
 }
 
-// 3/6/12か月モメンタム（終値の比率 - 1）。基準日と過去営業日スナップショットだけで計算（全銘柄一括取得）
-async function buildMomentumSnapshots() {
-  const dates = await getRecentTradingDates(260); // 約1年ぶん
+// 3/6/12か月モメンタム（営業日ベースの近似）
+async function buildMomentumSnapshots(idTokenOverride) {
+  const dates = await getRecentTradingDates(260, idTokenOverride);
   if (dates.length === 0) return { d0: new Map() };
-
-  const idx = dates.length - 1;                    // 最新
-  const idx3m = Math.max(0, dates.length - 63);    // おおよそ3ヶ月（63営業日）
-  const idx6m = Math.max(0, dates.length - 126);   // 約6ヶ月
-  const idx12m = Math.max(0, dates.length - 252);  // 約12ヶ月
+  const idx  = dates.length - 1;
+  const idx3 = Math.max(0, dates.length - 63);
+  const idx6 = Math.max(0, dates.length - 126);
+  const idx12= Math.max(0, dates.length - 252);
 
   const [dq0, dq3, dq6, dq12] = await Promise.all([
-    fetchDailyQuotesByDate(dates[idx]),
-    fetchDailyQuotesByDate(dates[idx3m]),
-    fetchDailyQuotesByDate(dates[idx6m]),
-    fetchDailyQuotesByDate(dates[idx12m]),
+    fetchDailyQuotesByDate(dates[idx], idTokenOverride),
+    fetchDailyQuotesByDate(dates[idx3], idTokenOverride),
+    fetchDailyQuotesByDate(dates[idx6], idTokenOverride),
+    fetchDailyQuotesByDate(dates[idx12], idTokenOverride),
   ]);
-
   const toMap = (arr) => new Map(arr.map(it => [codeStr(it.code), it.close]));
-  return {
-    d0: toMap(dq0),
-    d3: toMap(dq3),
-    d6: toMap(dq6),
-    d12: toMap(dq12),
-    dates: { d0: dates[idx], d3: dates[idx3m], d6: dates[idx6m], d12: dates[idx12m] }
-  };
+  return { d0: toMap(dq0), d3: toMap(dq3), d6: toMap(dq6), d12: toMap(dq12),
+           dates: { d0: dates[idx], d3: dates[idx3], d6: dates[idx6], d12: dates[idx12] } };
 }
-
 function calcReturn(nowClose, pastClose) {
-  const a = parseFloatSafe(nowClose);
-  const b = parseFloatSafe(pastClose);
+  const a = toNum(nowClose), b = toNum(pastClose);
   if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
   return a / b - 1;
 }
 
-// 直近4期 EPS/BPS/DPS の合成（TTM/最新推定）
+// statements（EPS/BPS/DPS の簡易要約）
+async function fetchFinsStatementsByCode(code, idTokenOverride) {
+  const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`, idTokenOverride);
+  return j.statements || [];
+}
 function summarizeFins(statements) {
   if (!Array.isArray(statements) || statements.length === 0) {
     return { eps_ttm: null, bps: null, dps: null, roe: null, roa: null };
   }
-  // 開示日降順でソート（念のため）
   const items = [...statements].sort((a, b) => {
-    const da = normalizeJQDateStr(pick(a, "DisclosedDate", "disclosedDate"));
-    const db = normalizeJQDateStr(pick(b, "DisclosedDate", "disclosedDate"));
-    return db.localeCompare(da);
+    return normDateStr(pick(b, "DisclosedDate", "disclosedDate"))
+         .localeCompare(normDateStr(pick(a, "DisclosedDate", "disclosedDate")));
   });
 
-  // EPSは四半期のEarningsPerShareを最大4つ合算（TTM）
   const epsVals = [];
   for (const it of items) {
-    const e = parseFloatSafe(pick(it, "EarningsPerShare", "eps", "EPS"));
+    const e = toNum(pick(it, "EarningsPerShare", "eps", "EPS"));
     if (e != null) epsVals.push(e);
     if (epsVals.length >= 4) break;
   }
-  const eps_ttm = epsVals.length ? epsVals.reduce((a, b) => a + b, 0) : null;
-
-  // BPS（BookValuePerShare）があれば最新を採用
-  const bps = parseFloatSafe(pick(items[0] || {}, "BookValuePerShare", "bps", "BPS")) ?? null;
-
-  // 配当は ResultDividendPerShareAnnual または ForecastDividendPerShareAnnual を優先
-  const dps = parseFloatSafe(
-    pick(items[0] || {},
-      "ResultDividendPerShareAnnual",
-      "ForecastDividendPerShareAnnual",
-      "dps", "DPS")
-  ) ?? null;
-
-  // ROE/ROA（もし項目があれば単純取得。J-Quants statements には固定で項目が無い場合が多い。）
-  const roe = parseFloatSafe(pick(items[0] || {}, "ROE", "roe"));
-  const roa = parseFloatSafe(pick(items[0] || {}, "ROA", "roa"));
-
+  const eps_ttm = epsVals.length ? epsVals.reduce((x, y) => x + y, 0) : null;
+  const bps = toNum(pick(items[0] || {}, "BookValuePerShare", "bps", "BPS")) ?? null;
+  const dps = toNum(pick(items[0] || {}, "ResultDividendPerShareAnnual", "ForecastDividendPerShareAnnual", "dps", "DPS")) ?? null;
+  const roe = toNum(pick(items[0] || {}, "ROE", "roe")); // 無い場合多い
+  const roa = toNum(pick(items[0] || {}, "ROA", "roa"));
   return { eps_ttm, bps, dps, roe, roa };
 }
 
-async function fetchFinsStatementsByCode(code) {
-  const j = await jqGET(`/fins/statements?code=${encodeURIComponent(code)}`);
-  return j.statements || [];
-}
-
-// ==============================
-// ルーティング
-// ==============================
+// ———————————————————————— ルーター
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname.replace(/\/+$/, "");
-    dlog("path", path);
+    const method = req.method.toUpperCase();
+    const idTokenOverride = readIdTokenOverride(req);
 
-    // CORS (必要なら調整)
-    if (req.method === "OPTIONS") {
+    // CORS
+    if (method === "OPTIONS") {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-ID-TOKEN");
       return res.status(204).end();
     }
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    // /api/health は無認可でOK（稼働確認用）
-    if (path === "/api/health") {
+    // /api/health は無認可でOK
+    if (path === "/api/health" && method === "GET") {
       return json(res, 200, {
         ok: true,
         ts: new Date().toISOString(),
@@ -353,15 +339,16 @@ export default async function handler(req, res) {
     // それ以外はプロキシ用ベアラー必須
     if (!requireProxyAuth(req, res)) return;
 
-    if (path === "/api/auth/refresh" && req.method === "POST") {
+    // idToken更新（内部キャッシュ）: POST
+    if (path === "/api/auth/refresh" && method === "POST") {
       const body = typeof req.body === "object" ? req.body : {};
-      // 任意で body.refreshToken / body.refreshtoken を受け付け
       const override = body?.refreshToken || body?.refreshtoken;
       const out = await refreshIdToken(override);
       return json(res, 200, out);
     }
 
-    if (path === "/api/prices/daily" && req.method === "GET") {
+    // 日次株価（JQのレスポンスをほぼ素通し）
+    if (path === "/api/prices/daily" && method === "GET") {
       const code = url.searchParams.get("code");
       const from = url.searchParams.get("from");
       const to = url.searchParams.get("to");
@@ -370,28 +357,24 @@ export default async function handler(req, res) {
       const q = new URLSearchParams({ code });
       if (from) q.set("from", from);
       if (to) q.set("to", to);
-
-      const j = await jqGET(`/prices/daily_quotes?${q.toString()}`);
-      // そのまま返す（JQのキーを温存）
+      const j = await jqGET(`/prices/daily_quotes?${q.toString()}`, idTokenOverride);
       return json(res, 200, j);
     }
 
-    if (path === "/api/fins/statements" && req.method === "GET") {
+    // 財務サマリ
+    if (path === "/api/fins/statements" && method === "GET") {
       const code = url.searchParams.get("code");
       if (!code) return json(res, 400, { error: "code is required" });
 
-      const stmts = await fetchFinsStatementsByCode(code);
+      const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
       const sum = summarizeFins(stmts);
 
-      // 終値・時価総額・PER/PBR/配当利回り 算出（可能な範囲）
-      const latestDate = await getLatestTradingDate();
-      const dq = await fetchDailyQuotesByDate(latestDate);
+      const latestDate = await getLatestTradingDate(idTokenOverride);
+      const dq = await fetchDailyQuotesByDate(latestDate, idTokenOverride);
       const me = dq.find(r => codeStr(r.code) === codeStr(code));
       const close = me?.close ?? null;
 
       let marketCap = null, per = null, pbr = null, dividend_yield = null;
-      // 発行株数が取れないので marketCap は不明（必要なら別API/自前保存）
-      // PER/PBR/配当利回りは Close と EPS/BPS/DPS があれば単純算出
       if (Number.isFinite(close)) {
         if (sum.eps_ttm != null && sum.eps_ttm !== 0) per = close / sum.eps_ttm;
         if (sum.bps != null && sum.bps !== 0) pbr = close / sum.bps;
@@ -416,14 +399,14 @@ export default async function handler(req, res) {
       });
     }
 
-    if (path === "/api/credit/weekly" && req.method === "GET") {
+    // 週次信用残
+    if (path === "/api/credit/weekly" && method === "GET") {
       const code = url.searchParams.get("code");
-      const weeks = parseIntSafe(url.searchParams.get("weeks")) || 26;
+      const weeks = Math.max(4, toInt(url.searchParams.get("weeks")) || 26);
       if (!code) return json(res, 400, { error: "code is required" });
 
-      const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`);
+      const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`, idTokenOverride);
       let items = (j.weekly_margin_interest || []).map(mapWeeklyMargin);
-      // 昇順に整えて、末尾から weeks 件
       items.sort((a, b) => a.date.localeCompare(b.date));
       if (items.length > weeks) items = items.slice(items.length - weeks);
 
@@ -431,86 +414,66 @@ export default async function handler(req, res) {
       const prev = items[items.length - 2] || {};
       const metrics = {
         code: codeStr(code),
-        latest: latest.date ? latest : {
-          date: null, buying: null, selling: null, net: null, ratio: null
-        },
+        latest: latest.date ? latest : { date: null, buying: null, selling: null, net: null, ratio: null },
         wow_change: {
           buying: (latest.buying != null && prev.buying != null) ? latest.buying - prev.buying : null,
           selling: (latest.selling != null && prev.selling != null) ? latest.selling - prev.selling : null,
           net: (latest.net != null && prev.net != null) ? latest.net - prev.net : null,
         }
       };
-
-      return json(res, 200, {
-        code: codeStr(code),
-        count: items.length,
-        metrics,
-        items
-      });
+      return json(res, 200, { code: codeStr(code), count: items.length, metrics, items });
     }
 
-    if (path === "/api/credit/daily_public" && req.method === "GET") {
+    // 日々公表信用残
+    if (path === "/api/credit/daily_public" && method === "GET") {
       const code = url.searchParams.get("code");
-      const days = parseIntSafe(url.searchParams.get("days")) || 60;
+      const days = Math.max(7, toInt(url.searchParams.get("days")) || 60);
       if (!code) return json(res, 400, { error: "code is required" });
 
-      // from/to は日付で切って良い（営業日でなくてもAPI側で調整される）
       const today = new Date();
       const to = today.toISOString().slice(0, 10);
-      const fromDate = new Date(today.getTime() - (days + 20) * 24 * 60 * 60 * 1000);
-      const from = fromDate.toISOString().slice(0, 10);
+      const from = new Date(today.getTime() - (days + 20) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
       const q = new URLSearchParams({ code, from, to });
-      const j = await jqGET(`/markets/daily_margin_interest?${q.toString()}`);
+      const j = await jqGET(`/markets/daily_margin_interest?${q.toString()}`, idTokenOverride);
       let items = (j.daily_margin_interest || []).map(mapDailyPublic);
       items.sort((a, b) => a.date.localeCompare(b.date));
       if (items.length > days) items = items.slice(items.length - days);
-
-      return json(res, 200, {
-        code: codeStr(code),
-        count: items.length,
-        items
-      });
+      return json(res, 200, { code: codeStr(code), count: items.length, items });
     }
 
-    if (path === "/api/screen/liquidity" && req.method === "GET") {
+    // 流動性プリフィルタ（平均売買代金）
+    if (path === "/api/screen/liquidity" && method === "GET") {
       const market = url.searchParams.get("market") || "All";
-      const minAvg = parseIntSafe(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
-      const days = parseIntSafe(url.searchParams.get("days")) ?? 20;
+      const minAvg = toInt(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
+      const days = toInt(url.searchParams.get("days")) ?? 20;
 
-      const [listedMap, liq] = await Promise.all([getListedMap(), buildLiquidityAndClose(days)]);
+      const [listedMap, liq] = await Promise.all([getListedMap(idTokenOverride), buildLiquidityAndClose(days, idTokenOverride)]);
       const out = [];
-
       for (const [code, avg_trading_value] of liq.avgTV.entries()) {
         const meta = listedMap.get(code) || { name: "", marketJa: "" };
         if (!marketMatch(market, meta.marketJa)) continue;
         if (!Number.isFinite(avg_trading_value) || avg_trading_value < minAvg) continue;
-
-        out.push({
-          code,
-          name: meta.name,
-          market: meta.marketJa,
-          avg_trading_value: Math.round(avg_trading_value)
-        });
+        out.push({ code, name: meta.name, market: meta.marketJa, avg_trading_value: Math.round(avg_trading_value) });
       }
-
       out.sort((a, b) => b.avg_trading_value - a.avg_trading_value);
       return json(res, 200, { count: out.length, items: out });
     }
 
-    if (path === "/api/screen/basic" && req.method === "GET") {
+    // 総合スクリーナー
+    if (path === "/api/screen/basic" && method === "GET") {
       const market = url.searchParams.get("market") || "All";
-      const limit = Math.min(Math.max(parseIntSafe(url.searchParams.get("limit")) || 30, 1), 200);
-      const liquidity_min = parseIntSafe(url.searchParams.get("liquidity_min")) ?? 100_000_000;
-      const per_lt = url.searchParams.get("per_lt") != null ? parseFloatSafe(url.searchParams.get("per_lt")) : null;
-      const pbr_lt = url.searchParams.get("pbr_lt") != null ? parseFloatSafe(url.searchParams.get("pbr_lt")) : null;
-      const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? parseFloatSafe(url.searchParams.get("div_yield_gt")) : null;
-      const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? parseFloatSafe(url.searchParams.get("mom3m_gt")) : null;
+      const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
+      const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
+      const per_lt = url.searchParams.get("per_lt") != null ? Number(url.searchParams.get("per_lt")) : null;
+      const pbr_lt = url.searchParams.get("pbr_lt") != null ? Number(url.searchParams.get("pbr_lt")) : null;
+      const div_yield_gt = url.searchParams.get("div_yield_gt") != null ? Number(url.searchParams.get("div_yield_gt")) : null;
+      const mom3m_gt = url.searchParams.get("mom3m_gt") != null ? Number(url.searchParams.get("mom3m_gt")) : null;
 
       const [listedMap, { avgTV, latestClose }, momSnaps] = await Promise.all([
-        getListedMap(),
-        buildLiquidityAndClose(20),
-        buildMomentumSnapshots()
+        getListedMap(idTokenOverride),
+        buildLiquidityAndClose(20, idTokenOverride),
+        buildMomentumSnapshots(idTokenOverride),
       ]);
 
       const items = [];
@@ -519,36 +482,32 @@ export default async function handler(req, res) {
         if (!marketMatch(market, meta.marketJa)) continue;
         if (!Number.isFinite(avg_trading_value) || avg_trading_value < liquidity_min) continue;
 
-        // モメンタム計算
         const mom_3m = calcReturn(momSnaps.d0.get(code), momSnaps.d3.get(code));
         const mom_6m = calcReturn(momSnaps.d0.get(code), momSnaps.d6.get(code));
         const mom_12m = calcReturn(momSnaps.d0.get(code), momSnaps.d12.get(code));
-
         if (mom3m_gt != null && (mom_3m == null || mom_3m < mom3m_gt)) continue;
 
-        // バリュー系（必要時のみ計算）—— per/pbr/yield 指定があれば statements 呼び
-        let per = null, pbr = null, dividend_yield = null, eps_ttm = null, bps = null, dps = null;
+        // バリュー系（必要時だけ statements を呼ぶ）
+        let per = null, pbr = null, dividend_yield = null;
         if (per_lt != null || pbr_lt != null || div_yield_gt != null) {
           try {
-            const stmts = await fetchFinsStatementsByCode(code);
+            const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
             const s = summarizeFins(stmts);
-            eps_ttm = s.eps_ttm; bps = s.bps; dps = s.dps;
             const close = latestClose.get(code);
             if (Number.isFinite(close)) {
               if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
               if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
               if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
             }
+            if (per_lt != null && !(per != null && per < per_lt)) continue;
+            if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
+            if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
           } catch (e) {
             dlog("fins fetch failed for", code, e.message);
+            continue;
           }
-
-          if (per_lt != null && !(per != null && per < per_lt)) continue;
-          if (pbr_lt != null && !(pbr != null && pbr < pbr_lt)) continue;
-          if (div_yield_gt != null && !(dividend_yield != null && dividend_yield > div_yield_gt)) continue;
         }
 
-        // 簡易スコア（流動性 + 3mモメンタムを主軸）
         const liqScore = Math.log10(Math.max(1, avg_trading_value));
         const momScore = (mom_3m == null ? 0 : mom_3m * 100);
         const score = Math.round(10 * (liqScore + momScore));
@@ -564,18 +523,18 @@ export default async function handler(req, res) {
       }
 
       items.sort((a, b) => b.score - a.score);
-      const sliced = items.slice(0, limit);
-      return json(res, 200, { count: sliced.length, items: sliced });
+      return json(res, 200, { count: Math.min(items.length, limit), items: items.slice(0, limit) });
     }
 
-    if (path === "/api/portfolio/summary" && req.method === "GET") {
+    // ポートフォリオ・サマリー
+    if (path === "/api/portfolio/summary" && method === "GET") {
       const codesParam = url.searchParams.get("codes");
-      const with_credit = parseIntSafe(url.searchParams.get("with_credit")) === 1;
+      const with_credit = toInt(url.searchParams.get("with_credit")) === 1;
       if (!codesParam) return json(res, 400, { error: "codes is required (comma-separated)" });
 
       const codes = codesParam.split(",").map(s => codeStr(s.trim())).filter(Boolean);
-      const [listedMap, latestDate] = await Promise.all([getListedMap(), getLatestTradingDate()]);
-      const dq = await fetchDailyQuotesByDate(latestDate);
+      const [listedMap, latestDate] = await Promise.all([getListedMap(idTokenOverride), getLatestTradingDate(idTokenOverride)]);
+      const dq = await fetchDailyQuotesByDate(latestDate, idTokenOverride);
       const closeMap = new Map(dq.map(it => [codeStr(it.code), it.close]));
 
       const out = [];
@@ -586,43 +545,31 @@ export default async function handler(req, res) {
         let error = null;
 
         try {
-          const stmts = await fetchFinsStatementsByCode(code);
+          const stmts = await fetchFinsStatementsByCode(code, idTokenOverride);
           const s = summarizeFins(stmts);
           eps_ttm = s.eps_ttm; bps = s.bps; dps = s.dps;
-
           if (Number.isFinite(close)) {
             if (s.eps_ttm != null && s.eps_ttm !== 0) per = close / s.eps_ttm;
             if (s.bps != null && s.bps !== 0) pbr = close / s.bps;
             if (s.dps != null && close !== 0) dividend_yield = s.dps / close;
           }
-        } catch (e) {
-          error = e.message;
-        }
+        } catch (e) { error = e.message; }
 
         if (with_credit) {
           try {
-            const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`);
+            const j = await jqGET(`/markets/weekly_margin_interest?code=${encodeURIComponent(code)}`, idTokenOverride);
             const arr = (j.weekly_margin_interest || []).map(mapWeeklyMargin).sort((a, b) => a.date.localeCompare(b.date));
             credit_latest = arr[arr.length - 1] || null;
-          } catch (e) {
-            error = (error ? error + "; " : "") + e.message;
-          }
+          } catch (e) { error = (error ? error + "; " : "") + e.message; }
         }
 
-        out.push({
-          code,
-          close, per, pbr, dividend_yield,
-          eps_ttm, bps, dps,
-          credit_latest,
-          error: error || null
-        });
+        out.push({ code, close, per, pbr, dividend_yield, eps_ttm, bps, dps, credit_latest, error: error || null });
       }
-
       return json(res, 200, { count: out.length, items: out });
     }
 
     // 未対応
-    return json(res, 404, { error: `No route for ${path}` });
+    return json(res, 404, { error: `No route for ${method} ${path}` });
   } catch (e) {
     console.error(e);
     return json(res, 500, { error: e.message || "Internal error" });
