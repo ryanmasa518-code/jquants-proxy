@@ -13,6 +13,10 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function json(res, code, obj) { res.status(code).json(obj); }
 function now() { return Date.now(); }
+function readIdTokenOverride(req) {
+  const h = req.headers["x-id-token"] || req.headers["X-ID-TOKEN"];
+  return (typeof h === "string" && h.trim()) ? h.trim() : null;
+}
 
 function pick(v, ...keys) {
   for (const k of keys) {
@@ -506,7 +510,8 @@ export default async function handler(req, res) {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname.replace(/\/+$/, "");
     const method = req.method.toUpperCase();
-    const idTokenOverride = readIdTokenOverride(req);
+    // /api/health は idToken 不要。先に health を返してから読む
+    let idTokenOverride = null;
 
     // CORS
     if (method === "OPTIONS") {
@@ -526,6 +531,7 @@ export default async function handler(req, res) {
         version: VERSION
       });
     }
+    idTokenOverride = readIdTokenOverride(req);
 
     // それ以外はプロキシ用Bearer必須
     if (!requireProxyAuth(req, res)) return;
