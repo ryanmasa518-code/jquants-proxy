@@ -9,6 +9,7 @@ const VERSION = "1.1.0-full-paging-fast";
 
 const isDebug = () => (process.env.LOG_LEVEL || "").toLowerCase() === "debug";
 const dlog = (...args) => { if (isDebug()) console.log("[DEBUG]", ...args); };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function json(res, code, obj) { res.status(code).json(obj); }
 function now() { return Date.now(); }
@@ -127,34 +128,51 @@ async function ensureIdToken() {
 }
 
 // 任意：クライアントが直渡しする場合
-function readIdTokenOverride(req) {
-  const h = req.headers["x-id-token"] || req.headers["X-ID-TOKEN"];
-  return typeof h === "string" && h.trim() ? h.trim() : null;
-}
-
 async function jqGET(pathWithQuery, idTokenOverride) {
   const idToken = idTokenOverride || await ensureIdToken();
   const url = `${JQ_BASE}${pathWithQuery}`;
-  dlog("JQ GET", url);
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    const msg = body && (body.message || body.error) ? ` ${JSON.stringify(body)}` : "";
-    throw new Error(`JQ GET failed: ${r.status}${msg}`);
+  let attempt = 0, lastErr;
+
+  while (attempt < 3) {
+    attempt++;
+    try {
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) return body;
+
+      // レート・一時障害はリトライ
+      if ([429, 500, 502, 503, 504].includes(r.status)) {
+        const backoff = 300 * Math.pow(2, attempt - 1); // 300, 600, 1200ms
+        await sleep(backoff);
+        continue;
+      }
+      // その他は即エラー
+      const msg = body && (body.message || body.error) ? ` ${JSON.stringify(body)}` : "";
+      throw new Error(`JQ GET failed: ${r.status}${msg}`);
+    } catch (e) {
+      lastErr = e;
+      if (attempt >= 3) break;
+      await sleep(300 * Math.pow(2, attempt - 1));
+    }
   }
-  return body;
+  throw lastErr || new Error("JQ GET failed");
 }
 
 // ★ ページングを最後まで取り切る共通ヘルパー
-async function jqGETAll(path, idTokenOverride) {
-  let out = [];
-  let next = null;
+async function jqGETAll(path, idTokenOverride, opt = {}) {
+  const maxPages = Number(opt.maxPages ?? 50);   // 上限
+  const sleepMs  = Number(opt.sleepMs  ?? 120);  // ページ間の待機
+
+  let out = [], next = null, pages = 0;
   do {
     const url = next ? `${path}&pagination_key=${encodeURIComponent(next)}` : path;
     const j = await jqGET(url, idTokenOverride);
     if (Array.isArray(j.daily_quotes)) out = out.concat(j.daily_quotes);
     next = j.pagination_key || null;
-  } while (next);
+    pages++;
+    if (next && pages < maxPages && sleepMs > 0) await sleep(sleepMs);
+  } while (next && pages < maxPages);
+
   return out;
 }
 
@@ -236,9 +254,8 @@ async function getLatestTradingDate(idTokenOverride) {
   const d = await getRecentTradingDates(1, idTokenOverride);
   return d[0];
 }
-async function fetchDailyQuotesByDate(dateStr, idTokenOverride) {
-  // ★ ページングを取り切る
-  const arr = await jqGETAll(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`, idTokenOverride);
+async function fetchDailyQuotesByDate(dateStr, idTokenOverride, opt = {}) {
+  const arr = await jqGETAll(`/prices/daily_quotes?date=${encodeURIComponent(dateStr)}`, idTokenOverride, opt);
   return arr.map(mapDailyQuote);
 }
 
@@ -619,6 +636,9 @@ export default async function handler(req, res) {
 
     // /api/screen/liquidity（fast=1 で軽量取得）
     if (path === "/api/screen/liquidity" && method === "GET") {
+      const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
+      const sleepMs  = toInt(url.searchParams.get("sleep_ms"))  ?? undefined;
+      const jqAllOpt = { maxPages, sleepMs };
       const market = url.searchParams.get("market") || "All";
       const minAvg = toInt(url.searchParams.get("min_avg_trading_value")) ?? 100_000_000;
       const days = toInt(url.searchParams.get("days"));
@@ -644,6 +664,9 @@ export default async function handler(req, res) {
 
     // /api/screen/basic（fast=1 でモメンタム計算を省略 → 安定動作確認用）
     if (path === "/api/screen/basic" && method === "GET") {
+      const maxPages = toInt(url.searchParams.get("max_pages")) ?? undefined;
+      const sleepMs  = toInt(url.searchParams.get("sleep_ms"))  ?? undefined;
+      const jqAllOpt = { maxPages, sleepMs };
       const market = url.searchParams.get("market") || "All";
       const limit = Math.min(Math.max(toInt(url.searchParams.get("limit")) || 30, 1), 200);
       const liquidity_min = toInt(url.searchParams.get("liquidity_min")) ?? 100_000_000;
